@@ -203,22 +203,9 @@ function G.publish(character, id, state, now)
         end
         return
     end
-    -- A world weapon let go of (dropped, thrown, disarmed): once it has come to rest, tell the partner where.
-    if state.origin and state.origin ~= origin then
-        state.released = { origin = state.origin, actor = state.heldActor, at = now + 1500 }
-    end
+    -- (A weapon let go of - thrown, dropped, disarmed - is followed by the throws section below, which shows its flight
+    -- and where it comes to rest.)
     state.origin, state.heldActor = origin, heldActor
-    local rel = state.released
-    if rel and now >= rel.at then
-        state.released = nil
-        pcall(function()
-            if not U.valid(rel.actor) then return end
-            local l, r = rel.actor:K2_GetActorLocation(), rel.actor:K2_GetActorRotation()
-            N.send(true, "wdrop", rel.origin, string.format("%.1f,%.1f,%.1f", l.X, l.Y, l.Z),
-                string.format("%.1f,%.1f,%.1f", r.Pitch, r.Yaw, r.Roll))
-            U.log("gear: %s let go of %s at %.0f %.0f %.0f", id, rel.origin, l.X, l.Y, l.Z)
-        end)
-    end
     local changed = state.sent == nil or not sameGear(desc, state.sent)
     if changed or now - (state.sentAt or 0) > RESEND_MS then
         if changed then
@@ -247,6 +234,14 @@ local function takenWeapon(origin)
     return w
 end
 
+-- Whether our player can pick it up: a weapon hidden here (the partner holds theirs, a stand-in) must not be - its
+-- pickup prompt stayed up and took the E press (lab: the joiner's E went to the hidden copy of the machete the host
+-- held, nothing was picked up).
+local function setUsable(w, on)
+    pcall(function() w.m_InteractionComponent:BPF_SetIsUsable(on) end)
+end
+G.setUsable = setUsable
+
 local function setTaken(origin, on)
     local w = (not on and takenWeapon(origin)) or localWeapon(origin)
     if not w then
@@ -257,6 +252,7 @@ local function setTaken(origin, on)
         w:SetActorHiddenInGame(on)
         w:SetActorEnableCollision(not on)
     end)
+    setUsable(w, not on)
     takenAway[origin] = on and w or nil
     U.log("gear: our %s %s", origin, on and "is in the partner's hands: hidden" or "is back")
 end
@@ -365,15 +361,315 @@ function G.hideHeld(character)
     end
 end
 
+-- THROWS ----------------------------------------------------------------------------------------------------------
+-- Only the hand-held copy was mirrored: a weapon the partner threw left their copy's hand and showed up again ~2 s
+-- later where it landed - its flight, its spin and its trail (FX_Throw) were never seen, and an object that broke
+-- stayed whole here (user's two-PC session, 2026-10-10: "couldn't see weapons thrown by the host... the animation
+-- and the weapon effect isn't visible on the join side at all").
+-- Every game watches the throwables of its own world (AThrowableActor: weapons, bottles, kicked objects). One in the
+-- air there (thrown, dropped, bouncing) is streamed: "wthrow" (identity, class, place) once, "wfly" 30 times a
+-- second, "wrest" where it stops, or that it broke. The other game flies its own copy of that object along the stream
+-- (collision off, its throw trail on), then leaves it at rest there; one that broke is hidden. An object only one game
+-- has (an enemy's own weapon, runtime spawns) gets a visual stand-in of its class for the flight and where it lies.
+local FLYING = { [5] = true, [6] = true, [7] = true, [8] = true, [9] = true, [10] = true, [13] = true, [14] = true }
+local AT_REST = { [0] = true, [1] = true }
+local PICKED, DESTROYED = 12, 15
+local FLY_SEND_MS, SCAN_MS, LIST_MS, MAX_FLIGHT_MS = 33, 200, 2000, 8000
+
+local throwList = { at = -1e9, list = {} }
+local function throwables()
+    local now = TailCoop_Clock()
+    if now - throwList.at > LIST_MS then
+        local ok, all = pcall(FindAllOf, "ThrowableActor")
+        throwList.list, throwList.at = {}, now
+        for _, a in ipairs(ok and all or {}) do
+            local okN, n = pcall(function() return a:GetFullName() end)
+            if okN and not n:find("Default__", 1, true) and n:find(":PersistentLevel.", 1, true) then
+                throwList.list[#throwList.list + 1] = a
+            end
+        end
+    end
+    return throwList.list
+end
+
+local function throwState(a)
+    local ok, s = pcall(function() return a:BPF_GetThrowableState() end)
+    return ok and tonumber(s) or nil
+end
+
+-- Identity in both games: a level-placed name or a training rack (originOf); else this game's own name ("rt:"), which
+-- the other game shows with a stand-in.
+local function throwKey(a)
+    return originOf(a) or ("rt:" .. a:GetFName():ToString())
+end
+
+local function localThrowable(key)
+    local kind, name = key:match("^(%a+):(.+)$")
+    if kind == "spawner" then return localWeapon(key) end
+    if kind ~= "actor" then return nil end
+    for _, a in ipairs(throwables()) do
+        if U.valid(a) and a:GetFName():ToString() == name then return a end
+    end
+    return nil
+end
+
+local function fmtLoc(l) return string.format("%.1f,%.1f,%.1f", l.X, l.Y, l.Z) end
+local function fmtRot(r) return string.format("%.1f,%.1f,%.1f", r.Pitch, r.Yaw, r.Roll) end
+local function parseRot(s)
+    local p, y, r = s:match("([^,]+),([^,]+),([^,]+)")
+    return { Pitch = tonumber(p), Yaw = tonumber(y), Roll = tonumber(r) }
+end
+
+-- The throw trail (and any other particle effect the object has) on or off.
+local particleClass
+local function trail(a, on)
+    particleClass = U.valid(particleClass) and particleClass or StaticFindObject("/Script/Engine.ParticleSystemComponent")
+    if not particleClass then return end
+    each(a:K2_GetComponentsByClass(particleClass), function(c)
+        pcall(function()
+            if c:GetFName():ToString():find("Throw", 1, true) then
+                if on then c:Activate(true) else c:Deactivate() end
+            end
+        end)
+    end)
+end
+
+-- Owner side.
+local flights = {}       -- key -> { actor, lastSend, start }  (flying in this game, streamed)
+local drivenUntil = {}   -- actor address -> clock until which we move it for the partner (never streamed back)
+local rested = {}        -- key -> actor: runtime objects shown by the partner with a stand-in (gone/picked -> told)
+local scanAt = -1e9
+
+local function sendRest(key, a, reason)
+    local okL, l = pcall(function() return a:K2_GetActorLocation() end)
+    local okR, r = pcall(function() return a:K2_GetActorRotation() end)
+    N.send(true, "wrest", key, okL and fmtLoc(l) or "", okR and fmtRot(r) or "", reason)
+    G.stats.rests = (G.stats.rests or 0) + 1
+    if G.stats.rests <= 30 then U.log("gear: %s came to rest (%s)", key, reason) end
+end
+
+local function ownerTick(now)
+    if now - scanAt >= SCAN_MS then
+        scanAt = now
+        local t = U.tick()
+        for _, a in ipairs(throwables()) do
+            if U.valid(a) then
+                local addr = a:GetAddress()
+                local st = (not drivenUntil[addr] or now > drivenUntil[addr]) and throwState(a) or nil
+                -- (Not one still in a hand: a worn weapon reads "broken, one last throw allowed" while held - lab, an
+                -- enemy's stick was streamed as a throw.)
+                if st and FLYING[st] then
+                    local okP, parent = pcall(function() return a:GetAttachParentActor() end)
+                    if okP and parent ~= nil and U.valid(parent) then st = nil end
+                end
+                if st and FLYING[st] then
+                    local okK, key = pcall(throwKey, a)
+                    if okK and key and not flights[key] then
+                        flights[key] = { actor = a, lastSend = 0, start = now }
+                        local cls = a:GetClass():GetFullName():match("%s(.+)$")
+                        N.send(true, "wthrow", key, cls or "", fmtLoc(a:K2_GetActorLocation()), fmtRot(a:K2_GetActorRotation()))
+                        G.stats.throws = (G.stats.throws or 0) + 1
+                        if G.stats.throws <= 30 then U.log("gear: %s is in the air (state %d): streamed to the partner", key, st) end
+                    end
+                end
+            end
+        end
+        -- Runtime objects the partner shows with a stand-in: gone or picked up here -> the stand-in goes.
+        for key, a in pairs(rested) do
+            local st = U.valid(a) and throwState(a) or nil
+            if not st or st == PICKED or st == DESTROYED then
+                rested[key] = nil
+                N.send(true, "wrest", key, "", "", "gone")
+            end
+        end
+        U.tock("throws scan", t)
+    end
+    for key, f in pairs(flights) do
+        local a = f.actor
+        local st = U.valid(a) and throwState(a) or nil
+        if not st or st == DESTROYED then
+            flights[key] = nil
+            N.send(true, "wrest", key, "", "", "broken")
+        elseif AT_REST[st] or st == PICKED or now - f.start > MAX_FLIGHT_MS then
+            flights[key] = nil
+            sendRest(key, a, st == PICKED and "picked" or "rest")
+            if key:find("^rt:") and st ~= PICKED then rested[key] = a end
+        elseif now - f.lastSend >= FLY_SEND_MS then
+            f.lastSend = now
+            pcall(function()
+                N.send(false, "wfly", key, now, fmtLoc(a:K2_GetActorLocation()), fmtRot(a:K2_GetActorRotation()))
+            end)
+        end
+    end
+end
+
+-- Receiver side.
+local shown = {}       -- key -> { actor, stand, snaps = { {t, loc, rot} }, restAt }
+local standIns = {}    -- key -> stand-in actor (runtime objects of the partner's)
+local classCache = {}
+
+local function standInFor(key, clsPath, loc, rot)
+    local a = standIns[key]
+    if a and U.valid(a) then return a end
+    local cls = classCache[clsPath]
+    if not U.valid(cls) then
+        cls = StaticFindObject(clsPath)
+        if not U.valid(cls) then pcall(LoadAsset, (clsPath:gsub("_C$", ""))); cls = StaticFindObject(clsPath) end
+        classCache[clsPath] = cls
+    end
+    if not U.valid(cls) then return nil end
+    local ok, spawned = pcall(function()
+        local gs = require("UEHelpers").GetGameplayStatics()
+        local xf = { Rotation = { X = 0, Y = 0, Z = 0, W = 1 }, Translation = loc, Scale3D = { X = 1, Y = 1, Z = 1 } }
+        local s = gs:BeginDeferredActorSpawnFromClass(U.world(), cls, xf, 1, nil)
+        gs:FinishSpawningActor(s, xf)
+        return s
+    end)
+    if not (ok and U.valid(spawned)) then return nil end
+    pcall(function() spawned:SetActorEnableCollision(false) end)
+    setUsable(spawned, false)  -- (the real one is in the partner's game)
+    drivenUntil[spawned:GetAddress()] = math.huge  -- ours to move, never streamed back as a throw of ours
+    standIns[key] = spawned
+    return spawned
+end
+
+local function onThrow(f)
+    local key, clsPath = f[1], f[2]
+    local loc, rot = parse3(f[3] or "0,0,0"), parseRot(f[4] or "0,0,0")
+    local a = localThrowable(key)
+    local stand = false
+    if not a then
+        a = standInFor(key, clsPath, loc, rot)
+        stand = true
+    end
+    if not (a and U.valid(a)) then
+        U.log("gear: the partner threw %s: nothing here to show it with (%s)", key, tostring(clsPath))
+        return
+    end
+    -- (Ours in our player's hands, or flying from our own throw: theirs is a different event - not shown.)
+    local st = throwState(a)
+    if not stand and (st == PICKED or (FLYING[st] and not drivenUntil[a:GetAddress()])) then return end
+    if not stand then drivenUntil[a:GetAddress()] = TailCoop_Clock() + MAX_FLIGHT_MS + 2000 end
+    pcall(function()
+        a:SetActorHiddenInGame(false)
+        a:SetActorEnableCollision(false)
+        a:K2_SetActorLocationAndRotation(loc, rot, false, {}, true)
+    end)
+    setUsable(a, false)  -- (in the air: back once it lands)
+    trail(a, true)
+    shown[key] = { actor = a, stand = stand, snaps = {} }
+    G.stats.shown = (G.stats.shown or 0) + 1
+    if G.stats.shown <= 30 then U.log("gear: the partner threw %s: shown here (%s)", key, stand and "stand-in" or "our copy") end
+end
+
+local function onFly(f)
+    local s = shown[f[1]]
+    if not s then return end
+    local t = tonumber(f[2])
+    if not t or (#s.snaps > 0 and t <= s.snaps[#s.snaps].t) then return end
+    s.snaps[#s.snaps + 1] = { t = t, at = TailCoop_Clock(), loc = parse3(f[3]), rot = parseRot(f[4]) }
+    if #s.snaps > 8 then table.remove(s.snaps, 1) end
+end
+
+local function onRest(f)
+    local key, reason = f[1], f[4]
+    local s = shown[key]
+    shown[key] = nil
+    local a = (s and s.actor) or standIns[key] or localThrowable(key)
+    if not (a and U.valid(a)) then return end
+    trail(a, false)
+    if reason == "broken" or reason == "gone" or reason == "picked" then
+        -- Broke there / picked up again (a held one shows in the holder's hand): out of sight here.
+        if reason ~= "picked" or key:find("^rt:") then
+            pcall(function()
+                a:SetActorHiddenInGame(true)
+                a:SetActorEnableCollision(false)
+            end)
+            setUsable(a, false)
+        end
+        if reason ~= "picked" and not key:find("^rt:") then takenAway[key] = nil end
+        return
+    end
+    pcall(function()
+        if f[2] ~= "" then a:K2_SetActorLocationAndRotation(parse3(f[2]), parseRot(f[3]), false, {}, true) end
+        a:SetActorHiddenInGame(false)
+        -- (A stand-in stays untouchable: the real one is in the partner's game.)
+        if not key:find("^rt:") then a:SetActorEnableCollision(true) end
+    end)
+    if not key:find("^rt:") then setUsable(a, true) end
+    if takenAway[key] then takenAway[key] = nil end
+    if not key:find("^rt:") then drivenUntil[a:GetAddress()] = TailCoop_Clock() + 1500 end
+end
+
+-- Every frame: each object the partner has in the air, 66 ms behind their stream (two updates to blend between).
+local FLY_DELAY_MS = 66
+local function lerp(a, b, k) return a + (b - a) * k end
+local function lerpAngle(a, b, k) return a + ((b - a + 540) % 360 - 180) * k end
+local function receiverTick(now)
+    for key, s in pairs(shown) do
+        local a = s.actor
+        if not U.valid(a) then
+            shown[key] = nil
+        elseif #s.snaps > 0 then
+            local renderAt = now - FLY_DELAY_MS
+            local p, q = s.snaps[1], nil
+            for i = 1, #s.snaps do
+                if s.snaps[i].at <= renderAt then p, q = s.snaps[i], s.snaps[i + 1] end
+            end
+            local loc, rot = p.loc, p.rot
+            if q then
+                local k = math.min(1, math.max(0, (renderAt - p.at) / math.max(1, q.at - p.at)))
+                loc = { X = lerp(p.loc.X, q.loc.X, k), Y = lerp(p.loc.Y, q.loc.Y, k), Z = lerp(p.loc.Z, q.loc.Z, k) }
+                rot = { Pitch = lerpAngle(p.rot.Pitch, q.rot.Pitch, k), Yaw = lerpAngle(p.rot.Yaw, q.rot.Yaw, k),
+                        Roll = lerpAngle(p.rot.Roll, q.rot.Roll, k) }
+            end
+            pcall(function() a:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+        end
+    end
+end
+
+G.stats = {}
+function G.throwStats()
+    local n = 0
+    for _ in pairs(shown) do n = n + 1 end
+    return string.format("throws streamed %d, rests sent %d, partner's throws shown %d (in the air now %d)",
+        G.stats.throws or 0, G.stats.rests or 0, G.stats.shown or 0, n)
+end
+
+local function resetThrows()
+    for _, a in pairs(standIns) do
+        pcall(function() if U.valid(a) then a:SetActorHiddenInGame(true); a:SetActorEnableCollision(false) end end)
+    end
+    flights, drivenUntil, rested, shown, standIns = {}, {}, {}, {}, {}
+    throwList.at = -1e9
+end
+
 -- Session over: every weapon we hid is ours again.
 function G.reset()
     for origin in pairs(takenAway) do setTaken(origin, false) end
     wanted = {}
+    resetThrows()
 end
 
 function G.start()
     N.on("gear", onGear)
     N.on("wdrop", onDrop)
+    N.on("wthrow", function(f) U.onGameThread("partner throw", function() onThrow(f) end) end)
+    N.on("wfly", onFly)
+    N.on("wrest", function(f) U.onGameThread("partner throw rest", function() onRest(f) end) end)
+    require("tc_flow").onMapChange(resetThrows)
+    U.poll("throws", 10, function()
+        local S, F = require("tc_session"), require("tc_flow")
+        if not (S.connected() and F.activity) then return false end
+        local now = TailCoop_Clock()
+        ownerTick(now)
+        receiverTick(now)
+        return false
+    end)
+    U.poll("throws stats", 20000, function()
+        if require("tc_session").connected() and require("tc_flow").activity then U.log("gear: %s", G.throwStats()) end
+        return false
+    end)
     require("tc_session").onChange(function()
         if not require("tc_session").connected() then G.reset() end
     end)

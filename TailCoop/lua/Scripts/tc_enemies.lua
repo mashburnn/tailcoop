@@ -501,10 +501,12 @@ local function dropTickets(c)
 end
 
 local function allowTickets(c)
+    -- (Not for Training Room enemies set to passive: the room turned their tickets off - tc_training.passive.)
+    local passive = require("tc_training").passive()
     pcall(function()
         local ai = c.m_AIComponent
         ai:BPF_SetPerceptionEnabled(true)
-        ai:BPF_SetCanTakeAttackTicket(true)
+        ai:BPF_SetCanTakeAttackTicket(not passive)
     end)
     local k = known[c:GetAddress()]
     if k then k.turnGate = nil end  -- tc_turns sets it again for this enemy

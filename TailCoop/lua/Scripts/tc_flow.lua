@@ -86,11 +86,17 @@ local function advance()
     end
     if pending.step == "training" and pending.mode == "arena" then
         if pending.settle and os.time() < pending.settle then return end
-        U.log("flow: step 2/2: CHALLENGES (OpenArenaSelection)")
-        menu:OpenArenaSelection()
+        -- The host picks the challenge; the joiner's game follows it (tc_arena) and gets no list to pick from (user,
+        -- 2026-10-10: "let the host control the rest of the menu").
+        local S = require("tc_session")
+        if S.role ~= "join" then
+            U.log("flow: step 2/2: CHALLENGES (OpenArenaSelection)")
+            menu:OpenArenaSelection()
+        end
         pending = nil
         F.entered = "arena"
-        U.log("flow: in the Arena scene, challenge list open")
+        U.log("flow: in the Arena scene, %s", S.role == "join" and "waiting for the host to pick a challenge"
+            or "challenge list open")
         return
     end
     if pending.step == "training" then

@@ -74,6 +74,7 @@ function U.loadConfig()
             if t.profile then c.profile = t.profile == "1" end
             c.hidetargets = t.hidetargets or c.hidetargets  -- lab: "0" leaves hidden characters targetable (compare)
             if t.autostart then c.autostart = t.autostart == "1" end
+            c.onepunch = t.onepunch or c.onepunch  -- lab: "1" = every enemy's structure breaks in one blow (takedown tests)
         end
     end
     local cmd = commandLine()

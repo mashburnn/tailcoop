@@ -27,9 +27,11 @@ Both players need the same TailCoop version. Remove other co-op mods first (for 
 
 - **Training Room together:** you see your friend's character with their exact moves. Enemies are shared: each one
   fights one of you and runs in that player's game. Hits land both ways, and there's no friendly fire.
-- **Arena challenges together:** either player picks the challenge, and you start together. The same waves appear on
-  both screens and kills in either game count. You both get the same result and stars, and Retry, Back and Main menu
-  apply to both.
+- **Arena challenges together:** the host picks the challenge (the friend's game follows), and you start together.
+  The same waves appear on both screens and kills in either game count. You both get the same result and stars, and
+  Retry, Back and Main menu apply to both.
+- **Weapons:** what each player holds shows in their hands on the other screen, and thrown weapons fly on both
+  screens and land in the same place.
   - A player who runs out of lives watches their friend; the challenge fails only when both are out.
   - Enemies take turns attacking the two of you instead of both at once.
 - **Pause:** opening the pause menu pauses only your game; meanwhile your enemies go to your friend.
@@ -38,6 +40,7 @@ Both players need the same TailCoop version. Remove other co-op mods first (for 
 
 This is an early version.
 - Takedowns and grabs on enemies your friend's game runs are untested.
+- Weapons: enemies' throws and the bo staff's bend may not show on the other screen yet.
 - Arena randomizer, capture-point and target challenges, and kill bonuses aren't shared yet.
 - Story mode and the Wuguan aren't co-op.
 

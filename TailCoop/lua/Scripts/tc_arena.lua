@@ -312,6 +312,13 @@ local HOOKS = {
     end,
     ["/Game/UI/Blueprints/Menus/Arena/BP_Menu_ArenaSelection.BP_Menu_ArenaSelection_C:TravelToArena"] = function()
         if applying or not picked or not S.connected() then return end
+        -- Only the host's pick counts: the joiner follows it (and is taken to the host's challenge if it went its own
+        -- way).
+        if S.role ~= "host" then
+            U.log("arena: we picked batch %d challenge %d, but the host picks: following the host's pick", picked.batch,
+                picked.challenge)
+            return
+        end
         sentGo = { batch = picked.batch, challenge = picked.challenge, at = TailCoop_Clock() }
         N.send(true, "arena", "go", picked.batch, picked.challenge)
         U.log("arena: we picked batch %d challenge %d, partner follows", picked.batch, picked.challenge)
@@ -324,22 +331,43 @@ local HOOKS = {
     end,
 }
 
+-- Hooked once the Blueprint is loaded, and retried every second until it takes: on a player's PC the challenge list's
+-- class was already loaded at the title screen but its TravelToArena not found yet ("no UFunction with the specified
+-- name") - hooked never, so the host's pick never reached the partner (user's two-PC session, 2026-10-10). A live
+-- instance's own function (its full name) is tried as well, the way the result screen's buttons are hooked.
 local function hookAll()
-    local pending = {}
+    local pending, failures = {}, {}
     for path, fn in pairs(HOOKS) do pending[path] = fn end
     U.poll("arena hooks", 1000, function()
         local left = 0
         for path, fn in pairs(pending) do
-            local class = path:match("^(.-):")
-            if class:find("^/Script/") or StaticFindObject(class) then
-                local ok, err = pcall(RegisterHook, path, function(...)
+            local class, fnName = path:match("^(.-):(.+)$")
+            local target = nil
+            if class:find("^/Script/") or StaticFindObject(class) then target = path end
+            if not target then
+                -- (A live widget of the class: its function's own path.)
+                local short = class:match("%.([%w_]+)$")
+                local inst = short and AR.live(short)
+                if inst then
+                    pcall(function() target = inst[fnName]:GetFullName():match("^%S+%s+(.+)$") end)
+                end
+            end
+            local ok, err = false, "not loaded yet"
+            if target then
+                ok, err = pcall(RegisterHook, target, function(...)
                     local args = { ... }
                     U.try("arena hook", function() fn(table.unpack(args)) end)
                 end)
-                if not ok then U.log("arena: can't hook %s: %s", path, tostring(err)) end
+            end
+            if ok then
                 pending[path] = nil
+                if failures[path] then U.log("arena: hooked %s (after %d tries)", fnName, failures[path]) end
             else
                 left = left + 1
+                if target then
+                    failures[path] = (failures[path] or 0) + 1
+                    if failures[path] == 1 then U.log("arena: can't hook %s yet (%s): trying again", fnName, tostring(err)) end
+                end
             end
         end
         return left == 0
@@ -351,6 +379,11 @@ local function onArena(f)
     if what == "go" then
         local b, c = tonumber(f[2]), tonumber(f[3])
         if not (b and c) then return end
+        -- (The host picks: a joiner's pick - an older version - isn't followed.)
+        if S.role == "host" then
+            U.log("arena: the joiner picked batch %d challenge %d: ignored, the host picks", b, c)
+            return
+        end
         -- Both picked at once: the host's pick wins.
         if sentGo and TailCoop_Clock() - sentGo.at < 3000 and S.role == "host" then
             U.log("arena: partner picked batch %d challenge %d at the same time as us: ours stands", b, c)

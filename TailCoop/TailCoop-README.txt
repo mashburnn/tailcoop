@@ -12,6 +12,7 @@ INSTALL (both players)
 PLAY
 - Title screen > CO-OP > HOST GAME, pick Training Room or Arena. The other player:
   CO-OP > JOIN GAME and picks the host's device from the list.
+- In the Arena the host picks the challenge; the other player's game follows.
 - The first time you host, Windows may ask to let Sifu through the firewall: allow it
   (Tailscale traffic only reaches it through your tailnet).
 - If the join list is empty, put the host's Tailscale address in

@@ -27,6 +27,23 @@ local function manager()
     return nil
 end
 
+-- The room's "passive" enemy behaviour (BP_TrainingManager.IsAIPassive; its SetAIBehaviour turns the enemies' attack
+-- tickets, reactions and defense off). TailCoop must leave such enemies passive: its turn-taking gate re-enabled
+-- their tickets every 2 s and its "nobody is coming, send one at the player" fix sent them at us - passive dummies
+-- attacked (user, 2026-10-10: "it says enemy is passive while being aggressive").
+local passiveCache = { at = -1e9, value = false, tm = nil }
+function T.passive()
+    if F.activity ~= "training" then return false end
+    local now = TailCoop_Clock()
+    if now - passiveCache.at >= 250 then
+        passiveCache.at = now
+        if not U.valid(passiveCache.tm) then passiveCache.tm = manager() end
+        local ok, p = pcall(function() return passiveCache.tm.IsAIPassive end)
+        passiveCache.value = ok and p == true
+    end
+    return passiveCache.value
+end
+
 local function send(...)
     if applyingRemote or not S.connected() then return end
     N.send(true, "train", ...)

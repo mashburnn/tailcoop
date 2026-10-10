@@ -78,6 +78,8 @@ end
 -- Every enemy run here: whom it fights, whether it holds a ticket; and its gate.
 local function countAndGate(now)
     local E = require("tc_enemies")
+    -- Training Room enemies set to passive stay passive: no tickets, never sent into the fight (tc_training.passive).
+    local passive = require("tc_training").passive()
     local c = { me = { held = 0, fighting = 0 }, partner = { held = 0, fighting = 0 } }
     local mine, direct = { me = {}, partner = {} }, { me = false, partner = false }
     for _, e in ipairs(E.running()) do
@@ -111,7 +113,7 @@ local function countAndGate(now)
             if okR and role == ROLE_DIRECT then direct[which] = true end
             -- Running here but in nobody's fight (combat role None: a handover's "fight this player" didn't take -
             -- lab: two such enemies stood by the joiner for minutes): perception on and the order again, every 2 s.
-            if okR and role == 0 and now - (e.engageAt or 0) >= 2000 then
+            if okR and role == 0 and not passive and now - (e.engageAt or 0) >= 2000 then
                 e.engageAt = now
                 local P = require("tc_presence")
                 local pc = U.playerController()
@@ -125,7 +127,7 @@ local function countAndGate(now)
                         which == "me" and "us" or "partner") end
                 end
             end
-            local allowed = not shared() or TT.allow[target] ~= false
+            local allowed = (not shared() or TT.allow[target] ~= false) and not passive
             -- Set when it changes, and again every 2 s (the game may reset it: spawns, phases).
             if e.turnGate ~= allowed or now - (e.turnGateAt or 0) > 2000 then
                 if pcall(function() ai:BPF_SetCanTakeAttackTicket(allowed) end) then
@@ -138,7 +140,8 @@ local function countAndGate(now)
     counted = c
     for _, which in ipairs({ "me", "partner" }) do
         local role = which == "me" and S.role or (S.role == "host" and "join" or "host")
-        if #mine[which] > 0 and c[which].held == 0 and not direct[which] and (not shared() or TT.allow[role] ~= false) then
+        if #mine[which] > 0 and c[which].held == 0 and not direct[which] and not passive
+            and (not shared() or TT.allow[role] ~= false) then
             idleSince[which] = idleSince[which] or now
             if now - idleSince[which] >= PROMOTE_MS then
                 idleSince[which] = now  -- (again in 2 s if that didn't take)
