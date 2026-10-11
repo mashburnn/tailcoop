@@ -267,7 +267,7 @@ end
 -- development-only tc_trace / tc_devtests, which the released mod doesn't include.)
 local SCRIPT_FILES = { "main", "tc_util", "tc_net", "tc_session", "tc_flow", "tc_anim", "tc_presence", "tc_moves",
     "tc_enemies", "tc_hits", "tc_pose", "tc_gear", "tc_aggro", "tc_training", "tc_menu", "tc_timeline", "tc_arena",
-    "tc_turns" }
+    "tc_turns", "tc_pvp" }
 
 function U.modVersion()
     if U._modVersion then return U._modVersion end

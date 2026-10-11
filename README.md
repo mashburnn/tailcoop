@@ -18,7 +18,7 @@ Both players need the same TailCoop version. Remove other co-op mods first (for 
 
 ## Play
 
-- **Host:** title screen > **CO-OP** > **HOST GAME** > Training Room or Arena.
+- **Host:** title screen > **CO-OP** > **HOST GAME** > Training Room, Arena or **PvP** (then pick a map).
 - **Friend:** **CO-OP** > **JOIN GAME** > the host's device.
 - The first time you host, Windows may ask to let Sifu through the firewall: allow it.
 - Join list empty? Put the host's Tailscale address in `ue4ss\Mods\TailCoop\TailCoop.ini` (`peer = 100.x.y.z`).
@@ -35,6 +35,9 @@ Both players need the same TailCoop version. Remove other co-op mods first (for 
   - A player who runs out of lives watches their friend; the challenge fails only when both are out.
   - Enemies take turns attacking the two of you instead of both at once.
 - **Pause:** opening the pause menu pauses only your game; meanwhile your enemies go to your friend.
+- **PvP:** fight your friend on an Arena map (The Streets, The Pit, Rooftop, Wuguan, Snow Garden), no enemies. Knock them out to win a round; first to 3 wins the match, then a new one starts. The score is at
+  the top of the screen (yours first). Your hits land in your friend's game, so their block, parry or dodge counts.
+  Leave or retry from the pause menu: both games follow.
 
 ## Not yet
 
@@ -44,6 +47,8 @@ This is an early version.
 - Weapons: enemies' throws and the bo staff's bend may not show on the other screen yet.
 - Arena randomizer, capture-point and target challenges, and kill bonuses aren't shared yet.
 - Story mode and the Wuguan aren't co-op.
+- PvP: no takedowns or grabs between players; your hit's reaction shows on your friend's screen a moment late (one
+  network round trip).
 
 ## Uninstall
 

@@ -1,15 +1,14 @@
-# Whitelist: the public repo is the mod only - its source, UE4SS settings, packaging and install guide. Never the
-# game, decoded data, saves/logs, tools, build output or the development test setup.
+# Whitelist: the mod's source, UE4SS settings, packaging, docs, the test log and the lab scripts. Never the game,
+# decoded game data, saves/logs/screenshots, tools or build output.
 /*
 !/.gitignore
 !/README.md
+!/CLAUDE.md
+!/AGENTS.md
+!/docs/
+!/Lab/
 !/TailCoop/
-
 TailCoop/cpp/build/
-TailCoop/TESTLOG.md
-TailCoop/deploy.ps1
-TailCoop/lua/Scripts/tc_devtests.lua
-TailCoop/lua/Scripts/tc_trace.lua
 TailCoop/**/TailCoop.ini
 TailCoop/**/launch.ini
 *.log

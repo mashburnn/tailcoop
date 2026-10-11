@@ -6,8 +6,9 @@ local N = require("tc_net")
 
 local S = {}
 
-S.mode = nil        -- training | arena | story (chosen by the host)
+S.mode = nil        -- training | arena | pvp | story (chosen by the host)
 S.role = "none"     -- none | host | join
+S.pvpMap = nil      -- pvp: { batch, challenge } of the Arena map the host picked (tc_pvp.MAPS)
 local listeners = {}
 
 local function notify()
@@ -26,8 +27,8 @@ function S.bindAddress()
     return (U.config.system ~= "0" and U.config.peer == "127.0.0.1") and "127.0.0.1" or "tailscale"
 end
 
-function S.host(mode)
-    S.role, S.mode = "host", mode
+function S.host(mode, map)
+    S.role, S.mode, S.pvpMap = "host", mode, map
     local ok, err = N.host(U.config.port, S.bindAddress())
     notify()
     return ok, err
@@ -42,8 +43,14 @@ end
 
 function S.leave()
     N.leave()
-    S.role, S.mode = "none", nil
+    S.role, S.mode, S.pvpMap = "none", nil, nil
     notify()
+end
+
+-- The mode as sent to the partner: "mode|<mode>[|batch|challenge]".
+local function sendMode()
+    local m = S.pvpMap
+    if m then N.send(true, "mode", S.mode, m.batch, m.challenge) else N.send(true, "mode", S.mode) end
 end
 
 function S.status() return N.status() end
@@ -75,12 +82,14 @@ function S.start()
     -- The host tells the joiner which mode it picked as soon as they connect.
     N.onSystem("connected", function(peer)
         U.log("session: connected to %s", peer)
-        if S.role == "host" and S.mode then N.send(true, "mode", S.mode) end
+        if S.role == "host" and S.mode then sendMode() end
         notify()
     end)
     N.on("mode", function(f)
         S.mode = f[1]
-        U.log("session: host picked mode %s", S.mode)
+        local b, c = tonumber(f[2] or ""), tonumber(f[3] or "")
+        S.pvpMap = (b and c) and { batch = b, challenge = c } or nil
+        U.log("session: host picked mode %s%s", S.mode, S.pvpMap and string.format(" (batch %d challenge %d)", b, c) or "")
         notify()
     end)
     -- Every frame, on the game thread (handlers may touch game objects directly).

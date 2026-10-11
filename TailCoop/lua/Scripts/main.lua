@@ -22,6 +22,7 @@ U.try("aggro", function() require("tc_aggro").start() end)
 U.try("turns", function() require("tc_turns").start() end)
 U.try("training", function() require("tc_training").start() end)
 U.try("arena", function() require("tc_arena").start() end)
+U.try("pvp", function() require("tc_pvp").start() end)
 U.try("menu", function() require("tc_menu").start() end)
 
 -- Development builds only (tc_trace / tc_devtests aren't part of the released mod).

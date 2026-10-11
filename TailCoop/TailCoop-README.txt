@@ -10,9 +10,12 @@ INSTALL (both players)
 4. Remove any other co-op mod first (for example another mod's dsound.dll in the same folder).
 
 PLAY
-- Title screen > CO-OP > HOST GAME, pick Training Room or Arena. The other player:
+- Title screen > CO-OP > HOST GAME, pick Training Room, Arena or PvP. The other player:
   CO-OP > JOIN GAME and picks the host's device from the list.
 - In the Arena the host picks the challenge; the other player's game follows.
+- PvP: the host picks an Arena map; no enemies. Knock your friend out to win a round, first
+  to 3 wins the match. Score at the top of the screen (yours first). No takedowns or grabs
+  between players yet.
 - The first time you host, Windows may ask to let Sifu through the firewall: allow it
   (Tailscale traffic only reaches it through your tailnet).
 - If the join list is empty, put the host's Tailscale address in

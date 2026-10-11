@@ -13,7 +13,7 @@ local BUTTON_CLASS = "/Game/UI/Blueprints/Buttons/BP_Btn_TitleBtn.BP_Btn_TitleBt
 local VISIBLE, COLLAPSED = 0, 1
 
 -- Modes become selectable as their test gates pass (see TailCoop\TESTLOG.md).
-M.ENABLED_MODES = { training = true, arena = true, story = false }
+M.ENABLED_MODES = { training = true, arena = true, pvp = true, story = false }
 
 local state = {
     menuAddr = nil,      -- address of the menu we injected into
@@ -169,7 +169,7 @@ local function closeSubmenu(menu)
     if U.valid(state.coopButton) then focus(state.coopButton) end
 end
 
-local PARENT = { root = nil, host = "root", join = "root", lobby_host = "host", lobby_join = "join" }
+local PARENT = { root = nil, host = "root", join = "root", pvp = "host", lobby_host = "host", lobby_join = "join" }
 
 local function back(menu)
     local parent = PARENT[state.page]
@@ -177,8 +177,8 @@ local function back(menu)
     if parent then M.openPage(menu, parent) else closeSubmenu(menu) end
 end
 
-local function hostLobby(menu, mode)
-    local ok, err = S.host(mode)
+local function hostLobby(menu, mode, map)
+    local ok, err = S.host(mode, map)
     state.lastError = not ok and tostring(err) or nil
     M.openPage(menu, "lobby_host")
 end
@@ -191,6 +191,13 @@ local function joinLobby(menu, address)
 end
 
 local function upper(s) return tostring(s or ""):upper() end
+
+-- The session's mode as shown: "ARENA", "PVP - THE PIT"...
+local function modeLabel()
+    local label = F.MODE_LABEL[S.mode] or upper(S.mode)
+    if S.mode == "pvp" and S.pvpMap then label = label .. " - " .. require("tc_pvp").mapName(S.pvpMap) end
+    return label
+end
 
 -- Live pages are rebuilt when what they show changes: the session for the lobbies, the tailnet for JOIN.
 -- Static pages return nil.
@@ -219,9 +226,20 @@ local PAGES = {
         return {
             mode("TRAINING ROOM", "training"),
             mode("ARENA", "arena"),
+            M.ENABLED_MODES.pvp and { "PVP", function() M.openPage(menu, "pvp") end } or { "PVP (SOON)" },
             mode("STORY", "story"),
             { "BACK", function() back(menu) end },
         }
+    end,
+    -- PvP: the host picks the Arena map (tc_pvp.MAPS).
+    pvp = function(menu)
+        local items = {}
+        for _, m in ipairs(require("tc_pvp").MAPS) do
+            local map = { batch = m.batch, challenge = m.challenge }
+            items[#items + 1] = { "PVP - " .. m.name, function() hostLobby(menu, "pvp", map) end }
+        end
+        items[#items + 1] = { "BACK", function() back(menu) end }
+        return items
     end,
     join = function(menu)
         local items, listed = {}, {}
@@ -246,7 +264,7 @@ local PAGES = {
     end,
     lobby_host = function(menu)
         local st = S.status()
-        local mode = F.MODE_LABEL[S.mode] or upper(S.mode)
+        local mode = modeLabel()
         if st.state == "connected" then
             return {
                 { "PARTNER: " .. upper(st.peer) },
@@ -270,7 +288,7 @@ local PAGES = {
         if st.state == "connected" then
             return {
                 { "CONNECTED TO " .. upper(st.peer) },
-                { S.mode and ("HOST PICKED " .. (F.MODE_LABEL[S.mode] or upper(S.mode)) .. ", WAITING FOR START")
+                { S.mode and ("HOST PICKED " .. modeLabel() .. ", WAITING FOR START")
                     or "WAITING FOR THE HOST..." },
                 { "LEAVE", function() back(menu) end },
             }
@@ -369,7 +387,18 @@ local function tick()
             state.autoDone = true
             U.log("menu: auto %s (lab shortcut)", role)
             M.openPage(menu, "root")
-            if role == "host" then hostLobby(menu, U.config.mode) else joinLobby(menu, U.config.peer) end
+            if role == "host" then
+                -- (PvP: the map from launch.ini's arenabatch / arenachallenge, else the first one.)
+                local map = nil
+                if U.config.mode == "pvp" then
+                    local first = require("tc_pvp").MAPS[1]
+                    map = { batch = tonumber(U.config.arenabatch or "") or first.batch,
+                            challenge = tonumber(U.config.arenachallenge or "") or first.challenge }
+                end
+                hostLobby(menu, U.config.mode, map)
+            else
+                joinLobby(menu, U.config.peer)
+            end
         end
         if not state.backHooked then
             -- The Blueprint overrides BPE_HandleNavigationBack, so the native declaration's hook never fires;

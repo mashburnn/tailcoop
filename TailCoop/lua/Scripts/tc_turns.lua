@@ -280,7 +280,8 @@ function TT.start()
     end)
     if shared() then U.log("turns: shared (one player attacked at a time)") else U.log("turns: per player") end
     U.poll("turns", TICK_MS, function()
-        if not (S.connected() and F.activity) then
+        -- (No enemies in PvP.)
+        if not (S.connected() and F.activity) or S.mode == "pvp" then
             if active then
                 active = false
                 openAll()

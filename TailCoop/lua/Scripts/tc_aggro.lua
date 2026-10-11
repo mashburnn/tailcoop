@@ -154,14 +154,50 @@ end
 -- partner's own game decides about the others, and friendly fire is off.
 local hitSeq, sentHits = 0, {}
 local friendly = { hits = 0 }
+-- PvP: parries / dodges replayed here (onOutcome) - each lands on the partner's character as a hit of ours, captured
+-- like one: the next of our captures within REPLAY_MS is that replay, not a new hit to send.
+local replays = { n = 0, untilAt = 0 }
+local REPLAY_MS = 400
+-- The partner's character after a hit here: full health, full guard - their own game owns both. (Its guard broken
+-- here would offer a takedown on it, which only this game would play.)
+local function refillPuppet(p)
+    pcall(function()
+        local hc = p.m_HealthComponent
+        hc:BPF_ServerSetHealth(hc.m_fMaxHealth)
+    end)
+    pcall(function()
+        local d = p.m_DefenseComponent
+        d:BPF_IncreaseGuardGauge(d:BPF_GetMaxGuardGauge())
+    end)
+end
+
 function AG.onCaptured(ctx, text)
     local p = puppet()
     if not (p and ctx == p:GetAddress()) then return end
     local pPath = Hits.pathOf(p)
-    -- Our own player hitting the partner's character (should never happen: same faction as us, see preparePuppet).
     local me = myPawn()
     local myPath = me and Hits.pathOf(me)
-    if myPath and text:find("m_Instigator=[^,]*" .. myPath:gsub("%p", "%%%0")) then
+    local ours = myPath and text:find("m_Instigator=[^,]*" .. myPath:gsub("%p", "%%%0"))
+    -- PvP: our own player's hit on the partner's character goes to the partner's game, which plays it on them with
+    -- our character there as the attacker - their defense (block, parry, dodge) decides, as for an enemy's hit.
+    if ours and S.mode == "pvp" then
+        if replays.n > 0 and TailCoop_Clock() < replays.untilAt then
+            replays.n = replays.n - 1
+        elseif not require("tc_presence").isPaused(S.role) then
+            local t = Hits.replace(Hits.replace(text, myPath, "$I$"), pPath, "$T$")
+            hitSeq = hitSeq + 1
+            sentHits[hitSeq] = { id = "player", text = text, at = TailCoop_Clock() }
+            sentHits[hitSeq - 40] = nil
+            N.sendLarge("phit", "player\n" .. hitSeq .. "\n" .. t)
+            stats.hitsOut = stats.hitsOut + 1
+            if stats.hitsOut <= 30 then U.log("aggro: our hit on the partner (PvP), forwarded") end
+        end
+        refillPuppet(p)
+        return
+    end
+    -- Our own player hitting the partner's character (co-op: should never happen, same faction as us, see
+    -- preparePuppet).
+    if ours then
         friendly.hits = friendly.hits + 1
         if friendly.hits <= 10 then U.log("aggro: our own hit landed on the partner's character (ignored)") end
     end
@@ -179,10 +215,7 @@ function AG.onCaptured(ctx, text)
             break
         end
     end
-    pcall(function()
-        local hc = p.m_HealthComponent
-        hc:BPF_ServerSetHealth(hc.m_fMaxHealth)
-    end)
+    refillPuppet(p)
 end
 
 -- Both (enemy owner): the partner parried / dodged one of our enemy's hits in their game. Here it already landed
@@ -207,6 +240,9 @@ local function onOutcome(f)
             dc:BPF_SetAutoAvoid(true)
         end
     end)
+    if sent.id == "player" then
+        replays.n, replays.untilAt = replays.n + 1, TailCoop_Clock() + REPLAY_MS
+    end
     local ok, err = TailCoop_CallImported(tostring(p.m_HitComponent:GetAddress()), tostring(foreignImpactFn:GetAddress()),
         m.m_Result, tostring(Hits.SIZE.result), m.m_Request, tostring(Hits.SIZE.request))
     pcall(function()
@@ -287,12 +323,18 @@ local function applyPending(now)
         if now >= h.at then
             table.remove(pending, i)
             local me = myPawn()
-            local enemy = require("tc_enemies").localActorFor(h.id)
+            -- (PvP: the partner's own player hit us - their character here is the attacker.)
+            local enemy = h.id == "player" and puppet() or require("tc_enemies").localActorFor(h.id)
+            local Pr = require("tc_presence")
             -- Down (Sifu's death and get-up): a hit landed on the partner's screen before they knew isn't played on us
-            -- (was: hit reactions on our body at health 0 - the user's session).
-            if require("tc_presence").isDown(S.role) then
+            -- (was: hit reactions on our body at health 0 - the user's session). PvP: nor while our game is paused, or
+            -- between rounds (tc_pvp).
+            if Pr.isDown(S.role) or (h.id == "player" and (Pr.isPaused(S.role) or require("tc_pvp").betweenRounds())) then
                 stats.whileDown = (stats.whileDown or 0) + 1
-                if stats.whileDown <= 10 then U.log("aggro: hit from the partner's %s dropped (we're down)", h.id) end
+                if stats.whileDown <= 10 then
+                    U.log("aggro: hit from the partner's %s dropped (%s)", h.id, Pr.isDown(S.role) and "we're down"
+                        or Pr.isPaused(S.role) and "our game is paused" or "between rounds")
+                end
             elseif not (me and enemy) then
                 stats.failed = stats.failed + 1
                 U.log("aggro: hit from the partner's %s dropped (%s)", h.id, me and "no copy of that enemy" or "no player")
@@ -426,15 +468,20 @@ function AG.start()
         local now = TailCoop_Clock()
         local p, me = puppet(), myPawn()
         if p then preparePuppet(p) end
-        if p and me then
+        local pvp = S.mode == "pvp"
+        if p and me and not pvp then
             noFriendlyFire(me, p, now)
             if U.config.test ~= "friendlyoff" then guardHits(me, p) end
+        elseif pvp and (friendlyFire.manager or guard.key) then
+            -- PvP: players may target and hit each other (Sifu's own faction table, no hit guard).
+            restoreFriendlyFire()
+            unguardHits()
         end
         applyPending(now)
         reportOutcomes(now)
         checkReactions(now)
         -- (With the joiner out of an Arena challenge its character is gone here: everything fights the host.)
-        if S.role == "host" and me and (p or require("tc_arena").isOut("join"))
+        if S.role == "host" and me and not pvp and (p or require("tc_arena").isOut("join"))
             and now - (AG.lastAssign or 0) >= ASSIGN_MS then
             AG.lastAssign = now
             assign(require("tc_enemies").list(), me, p, now)

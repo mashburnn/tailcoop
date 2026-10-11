@@ -5,7 +5,7 @@ local N = require("tc_net")
 
 local F = {}
 
-F.MODE_LABEL = { training = "TRAINING ROOM", arena = "ARENA", story = "STORY" }
+F.MODE_LABEL = { training = "TRAINING ROOM", arena = "ARENA", pvp = "PVP", story = "STORY" }
 
 local function titleMenu()
     -- FindAllOf can fail while a map is loading; treat that as "not there yet".
@@ -27,7 +27,7 @@ local FREE_TRAINING_CLICK =
 local pending = nil  -- { mode, step, since }
 
 local function enter(mode)
-    if mode ~= "training" and mode ~= "arena" then
+    if mode ~= "training" and mode ~= "arena" and mode ~= "pvp" then
         U.log("flow: mode %s is not supported yet", mode)
         return false
     end
@@ -48,7 +48,12 @@ local function advance()
     end
     if pending.step == "free" then menu = menu or true end  -- the last step doesn't need the title menu
     if not menu then return end  -- loading
-    if pending.step == "arena" and pending.mode == "arena" and menu:IsArenaChallengeMap() then
+    if pending.step == "arena" and pending.mode ~= "training" and menu:IsArenaChallengeMap() then
+        if pending.mode == "pvp" then
+            -- (In a challenge already: straight to the PvP map from here.)
+            pending.step = "training"
+            return
+        end
         -- Already in a challenge: ARENAS there opens the challenge list over the fight. Picking another challenge
         -- (tc_arena) works from here as well.
         U.log("flow: already in an Arena challenge (%s)", tostring(F.currentMap))
@@ -82,6 +87,21 @@ local function advance()
         end
         pending.step = "training"
         pending.settle = os.time() + 2  -- let the arena scene's menu finish appearing
+        return
+    end
+    -- PvP: the map the host picked, travelled to by both games (no challenge list: tc_pvp.MAPS).
+    if pending.step == "training" and pending.mode == "pvp" then
+        if pending.settle and os.time() < pending.settle then return end
+        local map = require("tc_session").pvpMap
+        pending = nil
+        if not map then
+            U.log("flow: PvP without a map from the host: staying in the Arena scene")
+            return
+        end
+        F.entered = "pvp"
+        local ok, err = require("tc_arena").travel(map.batch, map.challenge)
+        U.log("flow: step 2/2: PvP map (batch %d challenge %d): %s", map.batch, map.challenge,
+            ok and "travelling" or tostring(err))
         return
     end
     if pending.step == "training" and pending.mode == "arena" then

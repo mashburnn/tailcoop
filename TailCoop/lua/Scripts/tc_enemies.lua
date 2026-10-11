@@ -1926,14 +1926,20 @@ function E.start()
         watchers, lastActions, lastPoseAt, gearStates, actNow = {}, {}, {}, {}, {}
         connectedAt = nil
     end)
+    -- (PvP has no shared enemies - tc_pvp puts them away in each game; only the hits on the partner's character are
+    -- routed from here.)
     U.poll("enemies", SEND_MS, function()
-        if not (S.connected() and F.activity) then return false end
+        if not (S.connected() and F.activity) or S.mode == "pvp" then return false end
         joinerTick()   -- the ones the partner owns (+ the joiner's roster); ours are sent from "enemy actions"
         return false
     end)
     U.poll("enemy actions", 10, function()
         if not (S.connected() and F.activity) then
             if next(remote) ~= nil and not S.connected() then releaseAll() end
+            return false
+        end
+        if S.mode == "pvp" then
+            routeCaptures()
             return false
         end
         local now = clock()
@@ -1950,7 +1956,7 @@ function E.start()
         return false
     end)
     U.poll("enemies safety net", 1000, function()
-        if S.connected() and F.activity then stuckTick(clock()) end
+        if S.connected() and F.activity and S.mode ~= "pvp" then stuckTick(clock()) end
         return false
     end)
     -- (Hooks stay for the whole run: one try every 2 s until our player is in a fight.)
@@ -1994,6 +2000,20 @@ end
 
 -- For tests: our enemies with ids.
 function E.list() return liveScan() end
+
+-- PvP (tc_pvp): an enemy character (AI-controlled, not pooled, not a class default) / put one out of the game here:
+-- AI stopped, hidden, no collision, out of reach - never destroyed (Sifu may still point at it).
+function E.isEnemy(c) return isEnemy(c) end
+function E.putAway(c) retire(c) end
+function E.keepAway(c)
+    if not U.valid(c) then return end
+    pcall(function()
+        if c.Controller.BrainComponent:IsRunning() then c.Controller.BrainComponent:StopLogic("TailCoop: PvP") end
+    end)
+    dropTickets(c)
+    pcall(function() if not c.bHidden then c:SetActorHiddenInGame(true) end end)
+    outOfReach(c)
+end
 -- Lab: a character TailCoop must leave alone (a probe's own).
 function E.ignore(actor) retiredActors[actor:GetAddress()] = true end
 

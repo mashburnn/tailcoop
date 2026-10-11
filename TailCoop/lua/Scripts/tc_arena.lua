@@ -211,10 +211,12 @@ end
 local function onStarted()
     if started then return end
     started, ready, partnerReady, pendingStart = true, false, nil, false
-    F.activity = "arena"
+    -- (PvP plays on the challenge's map without its challenge: tc_pvp.)
+    local pvp = S.mode == "pvp"
+    F.activity = pvp and "pvp" or "arena"
     local b, c, name = AR.current()
-    U.log("flow: activity is now arena (%s, batch %s challenge %s)", tostring(name), tostring(b), tostring(c))
-    if S.role == "join" then AR.offsetAt = TailCoop_Clock() + 4000 end  -- after the intro camera hands over control
+    U.log("flow: activity is now %s (%s, batch %s challenge %s)", F.activity, tostring(name), tostring(b), tostring(c))
+    if S.role == "join" and not pvp then AR.offsetAt, AR.offsetWait = TailCoop_Clock() + 4000, nil end  -- after the intro
 end
 
 -- Retry / back to the challenge list / Arena main menu, from the result screen or the pause menu: the partner goes too
@@ -660,6 +662,52 @@ applyCounter = function(f, again)
     end
 end
 
+-- PvP (tc_pvp): this game's wave director sends nothing out (refill off, a wave it starts cancelled). True once the
+-- director has been found.
+function AR.stopWaves()
+    if not U.valid(director) then director = AR.live("AIWaveRefillDirector") end
+    if not director then return false end
+    pcall(function() director:BPF_SetRefillDisabled() end)
+    local ok, on = pcall(function() return director:BPF_IsWaveInProgress() end)
+    if ok and on then
+        local okC = pcall(function() director:BPF_CancelCurrentWave() end)
+        U.log("arena: our wave director started a wave: stopped (PvP): %s", tostring(okC))
+    end
+    return true
+end
+
+-- Our camera is on our own player, not on a challenge intro's camera.
+function AR.cameraOnPlayer()
+    local ok, onUs = pcall(function()
+        local pc = U.playerController()
+        local vt = pc.PlayerCameraManager.ViewTarget.Target
+        return U.valid(vt) and vt:GetAddress() == pc.Pawn:GetAddress()
+    end)
+    return ok and onUs
+end
+
+-- PvP (tc_pvp): our own text in the HUD's waves counter (big number, label). Only written when it differs.
+function AR.showText(number, label)
+    local inst = liveHud()
+    if not inst then return false end
+    -- (The counter's change animation sits on top of it, still showing the challenge's own numbers - "3 - 14" with its
+    -- "4" waves beside our score: kept out of sight.)
+    pcall(function()
+        local fx = inst.BP_Notif_ArenaNumberTransitionEffect
+        if U.valid(fx) and fx:GetVisibility() ~= 1 then fx:SetVisibility(1) end  -- Collapsed
+    end)
+    local c = counter(inst)
+    if c and c.ntext == number and c.ptext == label and c.nvis == 4 and c.pvis == 4 then return true end
+    textLib = U.valid(textLib) and textLib or StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
+    return pcall(function()
+        local n, p = inst.ProgressionCurrentNumber, inst.TextBlock_Progression
+        n:SetText(textLib:Conv_StringToText(number))
+        n:SetVisibility(4)  -- SelfHitTestInvisible: shown
+        p:SetText(textLib:Conv_StringToText(label))
+        p:SetVisibility(4)
+    end)
+end
+
 local function waveTick(now)
     if not (started and S.connected() and F.activity == "arena") then return end
     if S.role == "host" then sendCounter(now) end
@@ -684,8 +732,8 @@ local function waveTick(now)
 end
 
 -- Lab / tests: press Start here and on the partner's side.
-function AR.startBoth()
-    if press("test") then
+function AR.startBoth(why)
+    if press(why or "test") then
         if S.connected() then N.send(true, "arena", "start") end
         onStarted()
         return true
@@ -723,6 +771,10 @@ function AR.start()
             if pendingStart then
                 if press("partner pressed Start") then onStarted() end
             end
+            -- PvP: nothing to choose on the title screen - the host starts as soon as both games are there.
+            if S.mode == "pvp" and S.role == "host" and ready and partnerReady and not started and S.connected() then
+                AR.startBoth("PvP: both on the title screen")
+            end
         end
         hostResultTick()
         local now = TailCoop_Clock()
@@ -739,8 +791,15 @@ function AR.start()
             AR.waveCheckAt = now
             waveTick(now)
         end
-        -- Joiner: stand beside the host at the player start instead of on the same spot.
-        if AR.offsetAt and TailCoop_Clock() >= AR.offsetAt then
+        -- Joiner: stand beside the host at the player start instead of on the same spot. Not during the challenge's
+        -- intro (on its own camera; longer than 4 s on some maps): moving the player then cut its end short.
+        if AR.offsetAt and now >= AR.offsetAt and not AR.cameraOnPlayer() and now < (AR.offsetWait or now) + 60000 then
+            AR.offsetWait = AR.offsetWait or now
+            AR.offsetAt = now + 500
+        elseif AR.offsetAt and now >= AR.offsetAt and AR.offsetWait then
+            AR.offsetWait, AR.offsetAt = nil, now + 1000  -- (the intro's end handled first)
+            U.log("arena: the challenge's intro is over")
+        elseif AR.offsetAt and now >= AR.offsetAt then
             AR.offsetAt = nil
             U.try("arena offset", function()
                 local pc = U.playerController()
