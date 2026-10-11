@@ -98,7 +98,9 @@ local function countAndGate(now)
             -- whoever came near - "stuck, attacks sped up, turns 360 in place". Walking again (checked every second).
             -- (Only once it's in a fight and has been here a while: arena enemies come in with their movement off -
             -- climbing in, getting up - and that's Sifu's own doing.)
-            if now - (e.moveCheckAt or 0) >= 1000 and now - (e.foundAt or now) > 5000 then
+            -- (Nor while our player is down: Sifu holds the enemies still through the death and get-up - tc_presence.)
+            if now - (e.moveCheckAt or 0) >= 1000 and now - (e.foundAt or now) > 5000
+                and not require("tc_presence").isDown(S.role) then
                 e.moveCheckAt = now
                 local okM, mode = pcall(function() return e.actor.CharacterMovement.MovementMode end)
                 local okF, inFight = pcall(function() return ai:BPF_GetCurrentCombatRole() ~= 0 end)

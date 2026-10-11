@@ -64,8 +64,9 @@ local function assign(enemies, me, partner, now)
     -- A player who is out of an Arena challenge (game over, watching the partner) isn't fought, nor one whose game is
     -- paused (tc_presence: their world is frozen; the partner's goes on).
     local P = require("tc_presence")
-    local hostOut = AR.isOut("host") or P.isPaused("host")
-    local joinOut = AR.isOut("join") or P.isPaused("join")
+    -- (Nor one who's down - Sifu's death and get-up: tc_presence.isDown.)
+    local hostOut = AR.isOut("host") or P.isPaused("host") or P.isDown("host")
+    local joinOut = AR.isOut("join") or P.isPaused("join") or P.isDown("join")
     local items, count = {}, { host = 0, join = 0 }
     for _, e in ipairs(enemies) do
         if not E.isDead(e.id) then
@@ -287,7 +288,12 @@ local function applyPending(now)
             table.remove(pending, i)
             local me = myPawn()
             local enemy = require("tc_enemies").localActorFor(h.id)
-            if not (me and enemy) then
+            -- Down (Sifu's death and get-up): a hit landed on the partner's screen before they knew isn't played on us
+            -- (was: hit reactions on our body at health 0 - the user's session).
+            if require("tc_presence").isDown(S.role) then
+                stats.whileDown = (stats.whileDown or 0) + 1
+                if stats.whileDown <= 10 then U.log("aggro: hit from the partner's %s dropped (we're down)", h.id) end
+            elseif not (me and enemy) then
                 stats.failed = stats.failed + 1
                 U.log("aggro: hit from the partner's %s dropped (%s)", h.id, me and "no copy of that enemy" or "no player")
             else

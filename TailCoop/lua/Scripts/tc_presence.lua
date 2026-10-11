@@ -246,27 +246,55 @@ P.partnerOut = false
 -- whether it's paused ("ppause"), and a paused player counts as away for the moment: enemies leave them for the
 -- partner, and the enemies their game ran are handed over (tc_aggro) - the partner's game goes on. Back when they
 -- resume.
-local pausedState = { me = false, partner = false, sentAt = -1e9 }
+local pausedState = { me = false, partner = false, sentAt = -1e9, meDown = false, partnerDown = false, downAt = -1e9 }
 function P.isPaused(role)
     if role == S.role then return pausedState.me end
     return pausedState.partner
 end
 
+-- DOWN -----------------------------------------------------------------------------------------------------------
+-- A player knocked out (health 0: Sifu's death, then the get-up) is away for those seconds too. Their game freezes
+-- the enemies it runs while they're down (movement off, Sifu's own doing) - those fighting the partner as well - and
+-- the partner's enemies went on hitting them on the floor (user's session: hits applied at health 0, 10 deaths in 5
+-- minutes; "movement put back" 47 times, all in the seconds after a death). So, like a pause: "ppause" says it, the
+-- enemies of the downed player's game go to the partner, and nothing is forwarded to them until they're up again
+-- (DOWN_GRACE_MS after their health came back, for the get-up: Sifu still held an enemy still 3 s after - lab.)
+local DOWN_GRACE_MS = 4000
+function P.isDown(role)
+    if role == S.role then return pausedState.meDown end
+    return pausedState.partnerDown
+end
+
+local function ourPlayerDown(now)
+    local pc = U.playerController()
+    local me = pc and U.valid(pc.Pawn) and pc.Pawn or nil
+    local ok, h = pcall(function() return me.m_HealthComponent.m_fHealth end)
+    if ok and h and h <= 0 then pausedState.downAt = now end
+    return now - pausedState.downAt < DOWN_GRACE_MS
+end
+
 local function pauseTick()
     if not (S.connected() and F.activity) then
-        pausedState.me, pausedState.partner = false, false
+        pausedState.me, pausedState.partner, pausedState.meDown, pausedState.partnerDown = false, false, false, false
+        pausedState.downAt = -1e9
         return false
     end
     local ok, p = pcall(function() return UEHelpers.GetGameplayStatics():IsGamePaused(U.world()) end)
     p = ok and p == true
     local now = clock()
-    if p ~= pausedState.me or now - pausedState.sentAt > 2000 then
+    -- (Out of an Arena challenge - watching the partner - isn't down: tc_arena's "out" covers it.)
+    local d = ourPlayerDown(now) and not require("tc_arena").isOut(S.role)
+    if p ~= pausedState.me or d ~= pausedState.meDown or now - pausedState.sentAt > 2000 then
         if p ~= pausedState.me then
             U.log("presence: %s", p and "our game is paused: the partner's game goes on, our enemies go to them"
                 or "our game is running again")
         end
-        pausedState.me, pausedState.sentAt = p, now
-        N.send(true, "ppause", p and 1 or 0)
+        if d ~= pausedState.meDown then
+            U.log("presence: %s", d and "our player is down: the partner's game takes our enemies until we're up"
+                or "our player is up again")
+        end
+        pausedState.me, pausedState.meDown, pausedState.sentAt = p, d, now
+        N.send(true, "ppause", p and 1 or 0, d and 1 or 0)
     end
     return false
 end
@@ -358,6 +386,11 @@ function P.start()
             U.log("presence: the partner %s", p and "paused their game (away until they resume)" or "is back from pause")
         end
         pausedState.partner = p
+        local d = f[2] == "1"
+        if d ~= pausedState.partnerDown then
+            U.log("presence: the partner %s", d and "is down (their enemies come to us until they're up)" or "is up again")
+        end
+        pausedState.partnerDown = d
     end)
     U.poll("pause state", 200, pauseTick)
     S.onChange(function()

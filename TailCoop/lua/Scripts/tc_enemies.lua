@@ -1518,9 +1518,47 @@ local function onDead(f)
     end
     local h = health(c)
     local ok, err = true, nil
+    -- What our copy held (hidden with it while the partner ran the enemy): dropped as it dies, it would stay hidden -
+    -- and fall through the floor if its collision was off (a weapon hidden as the partner's).
+    local held = Gear.heldWeapons(c)
+    local from = nil
+    pcall(function()
+        local l = c:K2_GetActorLocation()
+        from = { x = l.X, y = l.Y, z = l.Z }
+    end)
+    for _, w in ipairs(held) do pcall(function() w:SetActorEnableCollision(true) end) end
     if h and h > 0 then ok, err = pcall(function() c:ServerSuicide(false) end) end
     U.log("enemies: the partner's %s died: our copy %s", id,
         not (h and h > 0) and "was dead already" or (ok and "killed" or ("NOT killed: " .. tostring(err))))
+    if #held > 0 then
+        -- Shown and usable once it has let go of them (the partner's game says where theirs came to rest, tc_gear;
+        -- one only this game has - spawned with our copy - lies where ours dropped it).
+        local tries = 0
+        U.poll("dropped weapons", 250, function()
+            tries = tries + 1
+            local left = 0
+            for i, w in pairs(held) do
+                if not U.valid(w) then
+                    held[i] = nil
+                else
+                    local okP, parent = pcall(function() return w:GetAttachParentActor() end)
+                    if okP and parent ~= nil and U.valid(parent) then
+                        left = left + 1
+                    else
+                        pcall(function()
+                            w:SetActorHiddenInGame(false)
+                            w:SetActorEnableCollision(true)
+                        end)
+                        Gear.rescue(w, from)
+                        Gear.setUsable(w, true)
+                        held[i] = nil
+                        U.log("enemies: %s dropped %s here as it died: shown, can be picked up", id, U.shortName(w))
+                    end
+                end
+            end
+            return left == 0 or tries >= 20
+        end)
+    end
 end
 
 -- The partner's player finished one of our enemies on their copy of it (a takedown or finisher there): ours dies too,
@@ -1684,8 +1722,9 @@ local function unstick(e, w, why)
 end
 
 local function stuckTick(now)
-    -- (Our game paused: nothing here moves, and that's fine.)
-    if require("tc_presence").isPaused(S.role) then
+    -- (Our game paused, or our player down - Sifu holds the enemies still: nothing here moves, and that's fine.)
+    local Pr = require("tc_presence")
+    if Pr.isPaused(S.role) or Pr.isDown(S.role) then
         for _, w in pairs(stuck) do w.at, w.act, w.outSince = now, now, nil end
         return
     end

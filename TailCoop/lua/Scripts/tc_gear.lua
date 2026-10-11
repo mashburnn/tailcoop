@@ -191,6 +191,12 @@ local function sameGear(a, b)
 end
 G.sameGear = sameGear
 
+-- Weapons a character of ours let go of without a throw (dropped, disarmed, died with it): origin -> { actor, at, sends }.
+-- The throws section only follows what it sees in the air, scanned 5 times a second - an enemy's weapon falling as it
+-- died was never seen (user's session: 0 throws streamed), and the partner's copy of it stayed hidden for good. Its rest
+-- place is told instead (ownerTick), twice: once fallen, once settled.
+local releases = {}
+
 -- Owner side: sends `id`'s gear when it changes / every RESEND_MS. state: a table this function keeps state in.
 function G.publish(character, id, state, now)
     if now - (state.at or 0) < SEND_MS then return end
@@ -204,7 +210,12 @@ function G.publish(character, id, state, now)
         return
     end
     -- (A weapon let go of - thrown, dropped, disarmed - is followed by the throws section below, which shows its flight
-    -- and where it comes to rest.)
+    -- and where it comes to rest; one it doesn't see fly is told from releases.)
+    if state.origin and state.origin ~= origin and state.heldActor and U.valid(state.heldActor) then
+        local okL, l = pcall(function() return character:K2_GetActorLocation() end)
+        releases[state.origin] = { actor = state.heldActor, at = now, sends = 0,
+                                   from = okL and { x = l.X, y = l.Y, z = l.Z } or nil }
+    end
     state.origin, state.heldActor = origin, heldActor
     local changed = state.sent == nil or not sameGear(desc, state.sent)
     if changed or now - (state.sentAt or 0) > RESEND_MS then
@@ -222,6 +233,8 @@ end
 
 local wanted = {}        -- id -> descriptor ("" = nothing)
 local takenAway = {}     -- origin -> our weapon hidden because the partner holds theirs
+local takenAt = {}       -- origin -> clock it was hidden
+local freeSince = {}     -- origin -> clock since which no character of the partner's holds it (for takenAway ones)
 
 -- Our hidden weapon for `origin`, if it still exists. Weapons go away during a fight (a bottle breaks, a pipe wears
 -- down and is replaced by its worn version): touching the one we kept then crashed the game (lab, 2026-10-09: the
@@ -248,13 +261,32 @@ local function setTaken(origin, on)
         takenAway[origin] = nil
         return
     end
+    -- (Its collision stays on: a weapon lying loose with its collision off falls through the floor - lab, a pipe and a
+    -- stick 1-1.4 km down by the time they were wanted back. Out of reach is the pickup prompt, setUsable.)
     pcall(function()
         w:SetActorHiddenInGame(on)
-        w:SetActorEnableCollision(not on)
+        if not on then w:SetActorEnableCollision(true) end
     end)
     setUsable(w, not on)
     takenAway[origin] = on and w or nil
+    takenAt[origin] = on and TailCoop_Clock() or nil
     U.log("gear: our %s %s", origin, on and "is in the partner's hands: hidden" or "is back")
+end
+
+-- A weapon that fell through the floor (dropped while its collision was off - a hidden one) is put back where it was
+-- let go of: from = { x, y, z } of the character that held it. True if it had to be.
+function G.rescue(w, from)
+    if not (from and U.valid(w)) then return false end
+    local ok, l = pcall(function() return w:K2_GetActorLocation() end)
+    if not ok or l.Z > from.z - 300 then return false end
+    pcall(function()
+        w:SetActorEnableCollision(true)
+        w:K2_SetActorLocation({ X = from.x, Y = from.y, Z = from.z + 40 }, false, {}, true)
+        w.RootComponent:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None"))
+    end)
+    U.log("gear: %s had fallen through the floor (%.0f m down): put back where it was dropped", U.shortName(w),
+        (from.z - l.Z) / 100)
+    return true
 end
 
 local function onGear(f)
@@ -262,9 +294,17 @@ local function onGear(f)
     local before = wanted[f[1]]
     wanted[f[1]] = desc
     -- The partner took a world weapon both games have: ours goes out of sight (and reach) meanwhile.
+    -- Only one lying loose here: one in a hand here is that same weapon in our copy of the same enemy's hand (an enemy
+    -- spawned with it, or that picked it up in both games) - hidden as ours, it stayed hidden once we ran that enemy,
+    -- in its hand and wherever it dropped it (user: "can't pick up dropped weapons"; lab: our own enemy holding a
+    -- hidden bat) - or our own player's.
     local newOrigin = desc:match("^[^|]*|[^|]*|(.+)$")
     local oldOrigin = before and before:match("^[^|]*|[^|]*|(.+)$")
-    if newOrigin and newOrigin ~= oldOrigin and not takenWeapon(newOrigin) then setTaken(newOrigin, true) end
+    if newOrigin and newOrigin ~= oldOrigin and not takenWeapon(newOrigin) then
+        local w = localWeapon(newOrigin)
+        local okP, parent = pcall(function() return w and w:GetAttachParentActor() end)
+        if not (okP and parent ~= nil and U.valid(parent)) then setTaken(newOrigin, true) end
+    end
 end
 
 -- The partner let go of it: ours appears where theirs came to rest.
@@ -375,6 +415,7 @@ local FLYING = { [5] = true, [6] = true, [7] = true, [8] = true, [9] = true, [10
 local AT_REST = { [0] = true, [1] = true }
 local PICKED, DESTROYED = 12, 15
 local FLY_SEND_MS, SCAN_MS, LIST_MS, MAX_FLIGHT_MS = 33, 200, 2000, 8000
+local RELEASE_MS, SETTLED_MS, FREE_MS = 1200, 3000, 4000
 
 local throwList = { at = -1e9, list = {} }
 local function throwables()
@@ -439,6 +480,7 @@ local flights = {}       -- key -> { actor, lastSend, start }  (flying in this g
 local drivenUntil = {}   -- actor address -> clock until which we move it for the partner (never streamed back)
 local rested = {}        -- key -> actor: runtime objects shown by the partner with a stand-in (gone/picked -> told)
 local scanAt = -1e9
+local shown = {}       -- receiver side (below): key -> { actor, stand, snaps = { {t, loc, rot} }, restAt }
 
 local function sendRest(key, a, reason)
     local okL, l = pcall(function() return a:K2_GetActorLocation() end)
@@ -474,6 +516,69 @@ local function ownerTick(now)
                 end
             end
         end
+        -- A weapon of ours hidden because the partner's character holds theirs, now in a hand here (our copy of that
+        -- enemy took it up - it was lying loose when the partner's gear came): ours again, solid. (In a hidden copy's
+        -- hand it's hidden again with it - hideHeld; its collision stays on, so it doesn't fall through the floor when
+        -- dropped: the bat of an enemy we ran did, 4 km down, with nothing to pick up.)
+        -- And one no character of the partner's holds any more (dropped, died with it, or the partner's game no longer
+        -- runs that enemy - its last gear report is stale), with no word of where it came to rest, is ours again after
+        -- FREE_MS where it lies: one stayed hidden for good otherwise.
+        local E = require("tc_enemies")
+        local S = require("tc_session")
+        local heldThere = {}
+        for id, desc in pairs(wanted) do
+            local o = desc:match("^[^|]*|[^|]*|(.+)$")
+            if o and (id == "p" or (E.ownerOf(id) ~= S.role and not E.isDead(id))) then heldThere[o] = true end
+        end
+        for origin, w in pairs(takenAway) do
+            if heldThere[origin] or shown[origin] then
+                freeSince[origin] = nil
+            else
+                freeSince[origin] = freeSince[origin] or now
+                if now - freeSince[origin] > FREE_MS and now - (takenAt[origin] or 0) > FREE_MS then
+                    freeSince[origin] = nil
+                    U.log("gear: our %s isn't in the partner's hands any more: back where it lies", origin)
+                    setTaken(origin, false)
+                end
+            end
+        end
+        for origin, w in pairs(takenAway) do
+            if U.valid(w) then
+                local okP, parent = pcall(function() return w:GetAttachParentActor() end)
+                if okP and parent ~= nil and U.valid(parent) then
+                    pcall(function() U.log("gear: our %s is in %s's hand here: ours again", origin, parent:GetFName():ToString()) end)
+                    local okH, hidden = pcall(function() return parent.bHidden end)
+                    if okH and hidden then
+                        pcall(function() w:SetActorEnableCollision(true) end)
+                        takenAway[origin] = nil
+                    else
+                        setTaken(origin, false)
+                    end
+                end
+            end
+        end
+        -- Let go of without a throw we saw (G.publish): where it lies, 1.2 s after (fallen) and 3 s after (settled).
+        for key, r in pairs(releases) do
+            if flights[key] then
+                releases[key] = nil
+            elseif now - r.at >= (r.sends == 0 and RELEASE_MS or SETTLED_MS) then
+                r.sends = r.sends + 1
+                local a = r.actor
+                if not U.valid(a) then
+                    releases[key] = nil
+                    N.send(true, "wrest", key, "", "", "broken")
+                else
+                    local okP, parent = pcall(function() return a:GetAttachParentActor() end)
+                    if okP and parent ~= nil and U.valid(parent) then
+                        releases[key] = nil  -- (in a hand again: that holder's gear says so)
+                    else
+                        G.rescue(a, r.from)
+                        sendRest(key, a, "rest")
+                        if r.sends >= 2 then releases[key] = nil end
+                    end
+                end
+            end
+        end
         -- Runtime objects the partner shows with a stand-in: gone or picked up here -> the stand-in goes.
         for key, a in pairs(rested) do
             local st = U.valid(a) and throwState(a) or nil
@@ -504,7 +609,7 @@ local function ownerTick(now)
 end
 
 -- Receiver side.
-local shown = {}       -- key -> { actor, stand, snaps = { {t, loc, rot} }, restAt }
+-- (shown: declared above, with the owner side, which checks it too.)
 local standIns = {}    -- key -> stand-in actor (runtime objects of the partner's)
 local classCache = {}
 
@@ -577,6 +682,14 @@ local function onRest(f)
     shown[key] = nil
     local a = (s and s.actor) or standIns[key] or localThrowable(key)
     if not (a and U.valid(a)) then return end
+    -- Ours is still in a hand: our copy of the enemy that let go of it. A dead one lets go here too; a live one keeps it
+    -- (its own weapon in Sifu's eyes - taken from it outside Sifu's logic, it could break the enemy).
+    local okP, holder = pcall(function() return a:GetAttachParentActor() end)
+    if okP and holder ~= nil and U.valid(holder) then
+        local okH, h = pcall(function() return holder.m_HealthComponent.m_fHealth end)
+        if not (okH and h and h <= 0) then return end
+        pcall(function() a:K2_DetachFromActor(1, 1, 1) end)  -- EDetachmentRule::KeepWorld
+    end
     trail(a, false)
     if reason == "broken" or reason == "gone" or reason == "picked" then
         -- Broke there / picked up again (a held one shows in the holder's hand): out of sight here.
@@ -591,7 +704,11 @@ local function onRest(f)
         return
     end
     pcall(function()
-        if f[2] ~= "" then a:K2_SetActorLocationAndRotation(parse3(f[2]), parseRot(f[3]), false, {}, true) end
+        if f[2] ~= "" then
+            a:K2_SetActorLocationAndRotation(parse3(f[2]), parseRot(f[3]), false, {}, true)
+            -- (Ours may have been falling - dropped with its collision off: it stops where theirs lies.)
+            pcall(function() a.RootComponent:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+        end
         a:SetActorHiddenInGame(false)
         -- (A stand-in stays untouchable: the real one is in the partner's game.)
         if not key:find("^rt:") then a:SetActorEnableCollision(true) end
@@ -647,7 +764,7 @@ end
 -- Session over: every weapon we hid is ours again.
 function G.reset()
     for origin in pairs(takenAway) do setTaken(origin, false) end
-    wanted = {}
+    wanted, freeSince, releases = {}, {}, {}
     resetThrows()
 end
 
