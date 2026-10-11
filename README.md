@@ -39,7 +39,8 @@ Both players need the same TailCoop version. Remove other co-op mods first (for 
 ## Not yet
 
 This is an early version.
-- Takedowns and grabs on enemies your friend's game runs are untested.
+- Takedowns and finishers on enemies your friend's game runs count in both games, but only your screen shows the
+  move itself; grabs are untested.
 - Weapons: enemies' throws and the bo staff's bend may not show on the other screen yet.
 - Arena randomizer, capture-point and target challenges, and kill bonuses aren't shared yet.
 - Story mode and the Wuguan aren't co-op.

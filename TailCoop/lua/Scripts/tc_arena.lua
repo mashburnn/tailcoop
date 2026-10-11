@@ -625,13 +625,26 @@ local function sendCounter(now)
     N.send(true, "arena", "counter", (c.ntext:gsub("|", "/")), c.nvis, c.pvis, (c.ptext:gsub("|", "/")), c.wave)
 end
 
-applyCounter = function(f)
+-- The host's latest counter stays ours: our stopped director still starts a wave of its own now and then (waveTick
+-- stops it), and the HUD then drew its own count - a wrong wave number until the host's next message, up to 5 s
+-- later (user: "the wave number at the top is incorrect sometimes and glitches"; lab: "3" from the host, our
+-- director's wave a second later, the host's "3" put back 4 s after). Put back within 250 ms (waveTick).
+local hostCounter, redrawn = nil, 0
+applyCounter = function(f, again)
+    hostCounter = f
     local inst = liveHud()
     local ntext, nvis, pvis, ptext, wave = f[2] or "", tonumber(f[3]), tonumber(f[4]), f[5] or "", tonumber(f[6])
     if not (inst and nvis and pvis) then return end
     local c = counter(inst)
     if c and c.ntext == ntext and c.nvis == nvis and c.pvis == pvis and c.ptext == ptext and (not wave or c.wave == wave) then
         return
+    end
+    if again then
+        redrawn = redrawn + 1
+        if redrawn <= 20 then
+            U.log("arena: our HUD drew its own waves counter (%s | %s): the host's put back", c and c.ntext or "?",
+                c and c.ptext or "?")
+        end
     end
     textLib = U.valid(textLib) and textLib or StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
     local ok, err = pcall(function()
@@ -642,13 +655,16 @@ applyCounter = function(f)
         p:SetText(textLib:Conv_StringToText(ptext))
         p:SetVisibility(pvis)
     end)
-    U.log("arena: the host's waves counter (%s | %s) -> ours: %s", ntext, ptext, ok and "ok" or tostring(err))
+    if not again then
+        U.log("arena: the host's waves counter (%s | %s) -> ours: %s", ntext, ptext, ok and "ok" or tostring(err))
+    end
 end
 
 local function waveTick(now)
     if not (started and S.connected() and F.activity == "arena") then return end
     if S.role == "host" then sendCounter(now) end
     if S.role ~= "join" then return end
+    if hostCounter then applyCounter(hostCounter, true) end
     if not U.valid(director) then director = AR.live("AIWaveRefillDirector") end
     if not director then return end
     -- From the start: its first wave's enemies then never come out (they were visible a second or two before being
@@ -685,6 +701,7 @@ function AR.start()
         endSent, endApplied, pendingNav = false, false, nil
         out.me, out.partner, outApplyAt, AR.watching, lastLife = false, false, nil, nil, false
         director, hud, hudText, AR.refillOff = nil, nil, { key = nil, at = -1e9 }, nil
+        hostCounter, redrawn = nil, 0
         require("tc_presence").partnerOut = false
     end)
     S.onChange(function()

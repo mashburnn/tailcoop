@@ -41,6 +41,8 @@ local targetOf = {}    -- id -> "host"|"join": the player it should fight (set b
 -- through the partner's character).
 local refused = {}     -- id -> clock
 local REFUSED_MS = 4000  -- (its stand-in here is usually ~1 s away)
+-- Enemies we just gave back because our copy was dead or in a takedown / grab (becomeOwner): not asked for again yet.
+local busyUntil = {}   -- id -> clock
 local function ownerOf(id) return owner[id] or "host" end
 local function mine(id) return ownerOf(id) == S.role end
 local function otherRole() return S.role == "host" and "join" or "host" end
@@ -200,6 +202,29 @@ local function health(c)
     return nil, nil
 end
 
+-- Sifu's synchronized moves: the order an enemy runs as the victim of a takedown, grab, push, environment attack or
+-- synchronized attack (EOrderType 9, 16, 26, 35, 41). A player's takedown runs only in that player's game, on whatever
+-- character is there - for an enemy the partner runs, our hidden copy of it.
+local VICTIM_ORDERS = { [9] = true, [16] = true, [26] = true, [35] = true, [41] = true }
+local function inSyncMove(c)
+    local ok, yes = pcall(function()
+        local oc = c:BPF_GetOrderComponent()
+        local ids = oc:BPF_GetRunningAndPendingActionOrders(false)
+        local found = false
+        local function one(v)
+            local orderId = type(v) == "number" and v or v:get()
+            if VICTIM_ORDERS[oc:BPF_GetOrderTypeFromOrderID(orderId)] then found = true end
+        end
+        if type(ids) == "table" then
+            for _, v in ipairs(ids) do one(v) end
+        elseif ids and ids.ForEach then
+            ids:ForEach(function(_, el) one(el) end)
+        end
+        return found
+    end)
+    return ok and yes
+end
+
 -- An enemy whose AI starts again here with nobody to fight (the partner left or went quiet) comes for our player;
 -- left alone it stood idle for the rest of the fight.
 local function aimAtMe(c)
@@ -241,11 +266,17 @@ local function sendSnapshot(e, now, h, m)
     local okL, l = pcall(function() return c:K2_GetActorLocation() end)
     if not okL then return end
     local yaw = c:K2_GetActorRotation().Yaw
-    -- What rarely changes (class, max health) goes reliably on its own, at first and every 3 s.
+    -- What rarely changes (class, max health, AI archetype) goes reliably on its own, at first and every 3 s.
     if not e.infoAt or now - e.infoAt > 3000 then
         e.infoAt = now
         e.classPath = e.classPath or A.path(c:GetClass()) or ""
-        N.send(true, "einfo", e.id, e.classPath, string.format("%.0f", m or -1))
+        if not e.archPath then
+            pcall(function()
+                local arch = c.m_AIComponent.m_CurrentAIArchetype
+                if U.valid(arch) then e.archPath = arch:GetFullName():match("^%S+%s+(.+)$") end
+            end)
+        end
+        N.send(true, "einfo", e.id, e.classPath, string.format("%.0f", m or -1), e.archPath or "")
     end
     if not e.stanceAt or now - e.stanceAt >= 200 then
         e.stanceAt = now
@@ -372,6 +403,60 @@ local function onInfo(f)
         remote[f[1]] = r
     end
     r.class, r.maxHealth = f[2], tonumber(f[3])
+    if f[4] and f[4] ~= "" then r.archetype = f[4] end
+end
+
+-- Joiner: our copy of a host enemy is the host's kind of enemy, not only its class. A copy one of our spawners sent out
+-- (makeCopy) took that spawner's AI archetype - the settings of whatever it was placed for: an arena miniboss came out
+-- as a common grunt or servant, with their max health (330 here, 60 or 100 there) and none of the miniboss's bars.
+-- Health came from the host, so it sat at or above the copy's max: its health bar counted as full and stayed hidden,
+-- or showed the wrong fill (user: "I'm not able to see the health of certain enemies"; lab: 11 of the joiner's 12
+-- spawned copies). Given the host's archetype and max health here; once per copy, then whenever the host's differ.
+-- (Archetypes are class default objects of the arena's DB classes, loaded in both games: looked up by path, each path
+-- once - a lookup of a path that isn't there costs ~35 ms.)
+local archetypes = {}  -- path -> object or false
+local function archetypeObject(path)
+    local a = archetypes[path]
+    if a == nil then
+        local o = StaticFindObject(path)
+        a = U.valid(o) and o or false
+        archetypes[path] = a
+    elseif a and not U.valid(a) then
+        archetypes[path] = nil
+        return archetypeObject(path)
+    end
+    return a or nil
+end
+
+local function matchHost(r, c)
+    if S.role ~= "join" then return end
+    if r.archetype and r.archApplied ~= r.archetype .. "@" .. tostring(c:GetAddress()) then
+        r.archApplied = r.archetype .. "@" .. tostring(c:GetAddress())
+        local arch = archetypeObject(r.archetype)
+        local ok, before = pcall(function()
+            local ai = c.m_AIComponent
+            local cur = ai.m_CurrentAIArchetype
+            local name = U.valid(cur) and cur:GetFName():ToString() or "-"
+            if arch and not (U.valid(cur) and cur:GetAddress() == arch:GetAddress()) then
+                ai.m_CurrentAIArchetype = arch
+                return name
+            end
+            return nil
+        end)
+        if ok and before then
+            U.log("enemies: our copy of %s was a %s: now the host's %s", r.id or "?", before, arch:GetFName():ToString())
+        elseif not arch then
+            U.log("enemies: the host's archetype for %s isn't loaded here (%s)", r.id or "?", r.archetype)
+        end
+    end
+    local _, m = health(c)
+    if r.maxHealth and r.maxHealth > 0 and m and math.abs(m - r.maxHealth) > 0.5 then
+        pcall(function() c.m_HealthComponent.m_fMaxHealth = r.maxHealth end)
+        if not r.maxLogged then
+            r.maxLogged = true
+            U.log("enemies: our copy of %s had max health %.0f: now the host's %.0f", r.id or "?", m, r.maxHealth)
+        end
+    end
 end
 
 local function onSnapshot(f)
@@ -939,10 +1024,11 @@ local function joinerTick()
             if e.dormant then wake(e) end
             takeControl(r, e.actor)
         end
-        -- (Arena challenges start together on both: their waves get stand-ins sooner.)
-        local proxyAfter = F.activity == "arena" and 800 or PROXY_AFTER_MS
-        if joiner and not e and fresh and not r.proxyTried and not deadIds[id] and now - r.firstHeard > proxyAfter then
-            spawnProxy(r, id)
+        -- (Arena challenges start together on both: their waves get stand-ins sooner - a wave spawner's enemy at once,
+        -- our own wave director is off: no enemy of ours to wait for. It came a second behind the host's.)
+        if joiner and not e and fresh and not r.proxyTried and not deadIds[id] then
+            r.proxyAfter = r.proxyAfter or (F.activity == "arena" and (waveId(id) and 150 or 800) or PROXY_AFTER_MS)
+            if now - r.firstHeard > r.proxyAfter then spawnProxy(r, id) end
         end
         -- Dead in the owner's game and no longer reported (its owner stops 3 s after the death): its twin goes, here
         -- on the host too. (Was: kept on the host - once the pose stream stopped, the twin went back to its own idle
@@ -1012,14 +1098,31 @@ local function joinerTick()
             outOfReach(r.parked[1])
         end
         if c then
+            matchHost(r, c)
             -- Our hits reach the host's enemy as real hits (sendOurHits), so the host's health is the truth: our copy
             -- adopts it, after a moment's grace when our own hit just took some off (no flicker back up).
+            -- Except what a synchronized move of our player's takes (a takedown, a grab): those aren't hits we send. A
+            -- takedown here killed our copy while the owner's enemy lived on, and the copy was brought back to life
+            -- from the owner's health - a dead character Sifu had done with: given to this game next, it was frozen
+            -- out of sight, the wave never ended (user: "killed all the enemies, stuck at wave 3, no enemy"; lab: a
+            -- takedown on the hidden copy took it to 0, back to the owner's health a second later). Its damage goes to
+            -- the owner instead, and a copy dead here is never revived: the owner's enemy dies too ("ekill").
             local h = health(c)
             if h and r.lastLocalHealth and h < r.lastLocalHealth - 0.01 then
                 stats.damageSent = stats.damageSent + 1
                 r.lastDamageAt = now
+                if h > 0 and inSyncMove(c) then
+                    N.send(true, "edmg", id, string.format("%.1f", r.lastLocalHealth - h))
+                    U.log("enemies: our player's move on %s took %.0f here: sent to its owner", id, r.lastLocalHealth - h)
+                end
             end
-            if r.health and r.health > 0 and h and (not r.lastDamageAt or now - r.lastDamageAt > 600)
+            if h and h <= 0 and not deadIds[id] and now - (r.killSentAt or -1e9) > 2000 then
+                r.killSentAt = now
+                N.send(true, "ekill", id)
+                U.log("enemies: our player finished %s here (a takedown or finisher on its copy): the %s's dies too", id,
+                    ownerOf(id) == "host" and "host" or "joiner")
+            end
+            if r.health and r.health > 0 and h and h > 0 and (not r.lastDamageAt or now - r.lastDamageAt > 600)
                 and math.abs(r.health - h) > 0.5 then
                 pcall(function() c.m_HealthComponent:BPF_ServerSetHealth(r.health) end)
                 h = health(c)
@@ -1249,6 +1352,22 @@ local function becomeOwner(id, f)
         U.log("enemies: given %s, but ours is a stand-in (it can't fight): the host keeps it", id)
         return
     end
+    -- Our copy dead here (our player finished it: its owner was told, "ekill") or inside a synchronized move (our
+    -- player's takedown or grab on it): run from here now, it came back to life wherever the move left it - once frozen
+    -- out of sight for the rest of the fight. Back to the partner until the move is over. (Not when the partner is
+    -- giving it back - no position: then it's ours whatever its state.)
+    if e and f[3] ~= "" and f[3] ~= "-" then
+        local h = health(e.actor)
+        local dead = h and h <= 0
+        if dead or inSyncMove(e.actor) then
+            owner[id] = otherRole()
+            busyUntil[id] = clock() + 1500
+            N.send(true, "eown", id, otherRole(), "", "", "", "", "", targetOf[id] or S.role)
+            U.log("enemies: given %s, but our copy is %s: back to the %s", id,
+                dead and "dead here" or "in a takedown or grab", otherRole() == "host" and "host" or "joiner")
+            return
+        end
+    end
     owner[id] = S.role
     local r = remote[id]
     if r then
@@ -1327,13 +1446,23 @@ local function quiet(id, now)
     return (not w or not w.current or w.current == "last") and (not last or now - last.at > 300)
 end
 
+-- Not in the middle of a synchronized move either (our player's takedown or grab on it, here): handed over then, it
+-- froze where the move had it (the 3 s limit cut takedowns short). Those wait up to SYNC_WAIT_MS.
+local SYNC_WAIT_MS = 15000
 local function handoverTick(now)
     for id, h in pairs(handovers) do
         if not mine(id) or deadIds[id] then
             handovers[id] = nil
         elseif quiet(id, now) or now - h.since > 3000 then
-            handovers[id] = nil
-            handOver(id, h.to, now)
+            local e = now - h.since < SYNC_WAIT_MS and entryFor(id) or nil
+            if not (e and inSyncMove(e.actor)) then
+                handovers[id] = nil
+                handOver(id, h.to, now)
+            elseif not h.waitLogged then
+                h.waitLogged = true
+                U.log("enemies: %s goes to the %s once the takedown / grab on it is over", id,
+                    h.to == "host" and "host" or "joiner")
+            end
         end
     end
 end
@@ -1392,6 +1521,234 @@ local function onDead(f)
     if h and h > 0 then ok, err = pcall(function() c:ServerSuicide(false) end) end
     U.log("enemies: the partner's %s died: our copy %s", id,
         not (h and h > 0) and "was dead already" or (ok and "killed" or ("NOT killed: " .. tostring(err))))
+end
+
+-- The partner's player finished one of our enemies on their copy of it (a takedown or finisher there): ours dies too,
+-- the game's own way (the arena's wave director counts it; "edead" goes back as for any death).
+local function onKill(f)
+    local id = f[1]
+    if deadIds[id] then return end
+    if not mine(id) then
+        U.log("enemies: the partner finished %s, but this game doesn't run it", id)
+        return
+    end
+    local e = entryFor(id)
+    if not e then
+        U.log("enemies: the partner finished %s, but this game has no copy of it", id)
+        return
+    end
+    local h = health(e.actor)
+    local ok, err = true, nil
+    if h and h > 0 then ok, err = pcall(function() e.actor:ServerSuicide(false) end) end
+    U.log("enemies: the partner's player finished %s there: ours %s", id,
+        not (h and h > 0) and "was dead already" or (ok and "killed" or ("NOT killed: " .. tostring(err))))
+end
+
+-- Focus -----------------------------------------------------------------------------------------------------------
+-- Sifu's Focus (F) copies the pose of the enemy whose vital point is aimed at onto its vital-points effect
+-- (BP_FightingPlayer UpdatePoseVitalPointsFX_PO: PoseableMesh:CopyPoseFromSkeletalComponent(FocusCurrentActorSelected
+-- .Mesh)). A twin's mesh follows a master pose (tc_pose): it has no pose of its own, and the copy read an empty bone
+-- array - the game crashed the moment the player focused on an enemy the partner runs (user: "when I pressed F the
+-- game crashed"; lab crash: read of address 0 under CopyPoseFromSkeletalComponent, via that function). The focus
+-- target is our hidden copy of the enemy instead: same place, its own pose, and what our player does to it goes to
+-- the enemy's owner. Anything else of ours following a master pose (the partner's character, put-away twins) is never
+-- copied from: the function sees our own player for that one call.
+local FOCUS_SET = "SetFocusCurrentActorSelected"
+local FOCUS_FX = "UpdatePoseVitalPointsFX_PO"
+
+-- For an actor Sifu's focus picked: our hidden copy behind it (a twin), false (one of ours with no pose of its own,
+-- nothing to put instead), or nil (not one of ours: left alone).
+local function focusSubstitute(actor)
+    if not U.valid(actor) then return nil end
+    local addr = actor:GetAddress()
+    for _, r in pairs(remote) do
+        if r.twin and U.valid(r.twin) and r.twin:GetAddress() == addr then
+            return r.controlled and U.valid(r.actor) and r.actor or false
+        end
+        if r.parked and r.parked[1] and U.valid(r.parked[1]) and r.parked[1]:GetAddress() == addr then return false end
+    end
+    local p = require("tc_presence").puppetActor()
+    if (U.valid(p) and p:GetAddress() == addr) or retiredActors[addr] then return false end
+    return nil
+end
+
+local focusStats = { swapped = 0, blocked = 0 }
+local function noteFocus(kind, actor)
+    focusStats[kind] = focusStats[kind] + 1
+    if focusStats[kind] <= 10 then
+        U.log("enemies: focus on %s: %s", U.shortName(actor),
+            kind == "swapped" and "our hidden copy of it is the target (its twin has no pose of its own)"
+            or "not ours to copy a pose from: skipped")
+    end
+end
+
+local focusSaved = nil  -- the selection put back after UpdatePoseVitalPointsFX_PO (one of ours with nothing instead)
+local function onFocusSet(ctx, actorParam)
+    local okA, a = pcall(function() return actorParam:get() end)
+    if not okA then return end
+    local sub = focusSubstitute(a)
+    if sub then
+        if pcall(function() actorParam:set(sub) end) then noteFocus("swapped", a) end
+    end
+end
+
+local function onFocusFxPre(ctx)
+    focusSaved = nil
+    local self = ctx:get()
+    local okS, sel = pcall(function() return self.FocusCurrentActorSelected end)
+    if not (okS and sel and U.valid(sel)) then return end
+    local sub = focusSubstitute(sel)
+    if sub then
+        self.FocusCurrentActorSelected = sub
+        noteFocus("swapped", sel)
+    elseif sub == false then
+        -- (Our own player, for this call only: a mesh with its own pose. Put back right after.)
+        focusSaved = sel
+        self.FocusCurrentActorSelected = self
+        noteFocus("blocked", sel)
+    end
+end
+
+local function onFocusFxPost(ctx)
+    if not focusSaved then return end
+    local saved = focusSaved
+    focusSaved = nil
+    pcall(function() ctx:get().FocusCurrentActorSelected = saved end)
+end
+
+-- Hooked from our player's own functions once one is in the world (its class loads with the first fight).
+local focusHooked = {}
+local function hookFocus()
+    if focusHooked[FOCUS_SET] and focusHooked[FOCUS_FX] then return true end
+    local pc = U.playerController()
+    local pawn = pc and U.valid(pc.Pawn) and pc.Pawn or nil
+    if not pawn then return false end
+    for _, fnName in ipairs({ FOCUS_SET, FOCUS_FX }) do
+        if not focusHooked[fnName] then
+            local okP, path = pcall(function() return pawn[fnName]:GetFullName():match("^%S+%s+(.+)$") end)
+            if okP and path then
+                local pre = fnName == FOCUS_SET and function(c, a) U.try("focus target", function() onFocusSet(c, a) end) end
+                    or function(c) U.try("focus pose", function() onFocusFxPre(c) end) end
+                local post = fnName == FOCUS_FX and function(c) U.try("focus pose", function() onFocusFxPost(c) end) end
+                    or nil
+                local ok, err = pcall(RegisterHook, path, pre, post)
+                focusHooked[fnName] = ok
+                if ok or not focusHooked[fnName .. " failed"] then
+                    focusHooked[fnName .. " failed"] = not ok
+                    U.log("enemies: focus guard on %s: %s", fnName, ok and "hooked" or tostring(err))
+                end
+            end
+        end
+    end
+    return focusHooked[FOCUS_SET] and focusHooked[FOCUS_FX]
+end
+
+-- Safety net ------------------------------------------------------------------------------------------------------
+-- Whatever left it so, an enemy nobody can reach can't be finished, and its Arena wave never ends. One this game runs
+-- that is far above or below both players (more than STUCK_Z) for OUT_MS, or - in an Arena challenge - alive and in
+-- the fight before, but neither moving nor acting for FROZEN_MS, is put back: its actions cancelled, shown, solid,
+-- walking, on its last good spot (where it last moved at the players' level), its AI restarted. Still stuck RETRY_MS
+-- after a second try, it's killed the game's own way: the wave counts it and goes on.
+-- (Watched in both games whoever runs it - our hidden copy follows the partner's - so a stuck enemy passed back and
+-- forth between the games is still seen as stuck.)
+local STUCK_Z, OUT_MS, FROZEN_MS, RETRY_MS = 600, 3000, 40000, 15000
+local stuck = {}   -- id -> { x, y, at (last moved), act (last action seen), engaged, good, outSince, fixes, fixedAt }
+
+local function playerZs()
+    local zs = {}
+    pcall(function() zs[#zs + 1] = U.playerController().Pawn:K2_GetActorLocation().Z end)
+    local p = require("tc_presence").puppetActor()
+    if U.valid(p) then pcall(function() zs[#zs + 1] = p:K2_GetActorLocation().Z end) end
+    return zs
+end
+
+local function unstick(e, w, why)
+    local c = e.actor
+    pcall(function() c:BPF_GetOrderComponent():BPF_CancelAllOrders() end)
+    pcall(function()
+        c:SetActorHiddenInGame(false)
+        c.Mesh:SetVisibility(true, true)
+        c:SetActorEnableCollision(true)
+    end)
+    if w.good then
+        pcall(function() c:K2_SetActorLocation({ X = w.good.x, Y = w.good.y, Z = w.good.z }, false, {}, true) end)
+    end
+    pcall(function()
+        c.CharacterMovement:SetMovementMode(1, 0)
+        c.Controller.BrainComponent:RestartLogic()
+    end)
+    allowTickets(c)
+    aimAt(c, targetOf[e.id] or S.role)
+    U.log("enemies: %s was %s: put back in the fight%s (try %d)", e.id, why,
+        w.good and string.format(" at %.0f %.0f %.0f", w.good.x, w.good.y, w.good.z) or "", w.fixes)
+end
+
+local function stuckTick(now)
+    -- (Our game paused: nothing here moves, and that's fine.)
+    if require("tc_presence").isPaused(S.role) then
+        for _, w in pairs(stuck) do w.at, w.act, w.outSince = now, now, nil end
+        return
+    end
+    local zs = playerZs()
+    if #zs == 0 then return end
+    local arena = F.activity == "arena"
+    for _, e in ipairs(liveScan()) do
+        local id = e.id
+        if deadIds[id] or e.dormant or e.wrongKind or e.proxy then goto nextEnemy end
+        do
+            -- Where it is in this game: ours, or our hidden copy placed from the partner's snapshots.
+            local c = mine(id) and e.actor or E.localActorFor(id)
+            if not c then goto nextEnemy end
+            local h = health(c)
+            if not h or h <= 0 then goto nextEnemy end
+            local okL, l = pcall(function() return c:K2_GetActorLocation() end)
+            if not okL then goto nextEnemy end
+            local w = stuck[id]
+            if not w then
+                w = { x = l.X, y = l.Y, at = now, act = now }
+                stuck[id] = w
+            end
+            if (l.X - w.x) ^ 2 + (l.Y - w.y) ^ 2 > 50 * 50 then
+                -- (Its first steps take it out of a spawn or an idle activity: in the fight from the next ones.)
+                if w.moved then w.engaged = true end
+                w.moved, w.x, w.y, w.at = true, l.X, l.Y, now
+            end
+            local a = actNow[id] or lastActions[id]
+            if a and a.at > (w.actAt or 0) then w.actAt, w.act, w.engaged = a.at, now, true end
+            local dz = math.huge
+            for _, z in ipairs(zs) do dz = math.min(dz, math.abs(l.Z - z)) end
+            if dz < 200 and now - w.at < 2000 then w.good = { x = l.X, y = l.Y, z = l.Z } end
+            if w.fixes and now - w.fixedAt > 60000 then w.fixes = nil end  -- (fine for a minute since)
+            if not mine(id) then goto nextEnemy end
+            local why = nil
+            -- (Not moving either: one walking about on another floor of the level is in reach.)
+            if dz > STUCK_Z and now - w.at > OUT_MS then
+                w.outSince = w.outSince or now
+                if now - w.outSince > OUT_MS then
+                    why = string.format("out of reach (%.0f m from the players' level)", dz / 100)
+                end
+            else
+                w.outSince = nil
+            end
+            local still = now - math.max(w.at, w.act)
+            if not why and arena and w.engaged and still > (w.fixes and RETRY_MS or FROZEN_MS) then
+                why = string.format("frozen (no move or action for %.0f s)", still / 1000)
+            end
+            if why and now - (w.fixedAt or -1e9) > RETRY_MS then
+                w.fixedAt = now
+                if (w.fixes or 0) < 2 then
+                    w.fixes = (w.fixes or 0) + 1
+                    w.at, w.act, w.outSince = now, now, nil  -- (time to move again)
+                    unstick(e, w, why)
+                else
+                    local ok, err = pcall(function() c:ServerSuicide(false) end)
+                    U.log("enemies: %s still %s after being put back twice: %s so the fight goes on", id, why,
+                        ok and "killed" or ("NOT killed (" .. tostring(err) .. ")"))
+                end
+            end
+        end
+        ::nextEnemy::
+    end
 end
 
 function E.isDead(id) return deadIds[id] ~= nil end
@@ -1477,6 +1834,7 @@ function E.assign(id, who, target)
     if mine(id) then
         handovers[id] = handovers[id] or { to = who, since = clock() }
     elseif requested[id] ~= who then
+        if who == S.role and (busyUntil[id] or 0) > clock() then return end
         requested[id] = who
         N.send(true, "ereq", id, who)
     end
@@ -1516,12 +1874,16 @@ function E.start()
     N.on("ereq", onRequest)
     N.on("etarget", onTarget)
     N.on("edead", function(f) U.onGameThread("enemy death", function() onDead(f) end) end)
+    N.on("ekill", function(f) U.onGameThread("enemy finished by the partner", function() onKill(f) end) end)
     S.onChange(function()
-        if not S.connected() then handovers, requested, targetOf, deadIds, refused = {}, {}, {}, {}, {} end
+        if not S.connected() then
+            handovers, requested, targetOf, deadIds, refused, busyUntil, stuck = {}, {}, {}, {}, {}, {}, {}
+        end
     end)
     -- A new world (another challenge, a retry): the same ids come back as new enemies, owned by the host again.
     F.onMapChange(function()
         owner, handovers, requested, targetOf, deadIds, refused = {}, {}, {}, {}, {}, {}
+        busyUntil, stuck = {}, {}
         watchers, lastActions, lastPoseAt, gearStates, actNow = {}, {}, {}, {}, {}
         connectedAt = nil
     end)
@@ -1547,6 +1909,15 @@ function E.start()
         routeCaptures()
         U.tock("route captures", t)
         return false
+    end)
+    U.poll("enemies safety net", 1000, function()
+        if S.connected() and F.activity then stuckTick(clock()) end
+        return false
+    end)
+    -- (Hooks stay for the whole run: one try every 2 s until our player is in a fight.)
+    U.poll("enemies focus guard", 2000, function()
+        if not F.activity then return false end
+        return hookFocus()
     end)
     U.poll("enemies stats", 20000, function()
         if S.connected() and F.activity then

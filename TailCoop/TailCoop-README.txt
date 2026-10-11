@@ -32,7 +32,8 @@ NOTES
   game version and the same TailCoop version.
 - Logs, if something goes wrong: ue4ss\Mods\TailCoop\TailCoop.log and
   ue4ss\Mods\TailCoop\native\TailCoopNative.log.
-- Not done yet: takedowns/grabs on enemies the other game runs are untested; Arena randomizer,
+- Not done yet: takedowns on enemies the other game runs count in both games but show only on
+  your screen, grabs are untested; Arena randomizer,
   capture-point and target challenges and kill bonuses aren't shared; story mode and the Wuguan
   aren't co-op.
 
